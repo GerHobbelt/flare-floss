@@ -25,10 +25,12 @@ This script automates the "vcpkg & jh" technique described in readme.md:
 It is intentionally modular so the underlying extractor (jh today) can be
 swapped for a more minimal tool later without rewriting the orchestration.
 
-After every library is parsed, strings that appear in two or more libraries
-are removed from *all* of those libraries. A shared string does not uniquely
-identify a library, so attributing it to any specific one would be a false
-positive at query time.
+Strings are NOT deduped across libraries: a string observed in both zlib
+and curl (e.g. when zlib is vendored into curl) stays in both databases.
+The query tagger already emits one ``#<library>`` tag per matching
+database, so the consumer can see the overlap directly. Within a single
+library, the same string still collapses to one entry (when
+``--no-deduplicate`` is not passed).
 """
 
 from __future__ import annotations
@@ -38,13 +40,14 @@ import re
 import sys
 import gzip
 import json
+import time
 import shutil
 import logging
 import pathlib
 import argparse
 import subprocess
-from typing import Set, Dict, List, Tuple, Iterable, Optional
-from dataclasses import field, dataclass
+from typing import Set, Dict, List, Tuple, Callable, Optional
+from dataclasses import dataclass
 
 logging.basicConfig(
     level=logging.INFO,
@@ -76,6 +79,34 @@ class BuildConfig:
     continue_on_error: bool = False
 
 
+def make_db_entry(
+    string: str,
+    library_name: Optional[str],
+    library_version: Optional[str],
+    file_path: Optional[str],
+    function_name: Optional[str],
+    line_number: Optional[int] = None,
+) -> dict:
+    """Construct a database entry using the standard OSS schema."""
+    return {
+        "string": string,
+        "library_name": library_name,
+        "library_version": library_version,
+        "file_path": file_path,
+        "function_name": function_name,
+        "line_number": line_number,
+    }
+
+
+@dataclass
+class ParseResult:
+    """Result of parsing jh JSONL output for a single library."""
+
+    entries: List[dict]
+    num_objects: int
+    num_functions: int
+
+
 @dataclass
 class LibraryMetrics:
     library: str
@@ -86,7 +117,6 @@ class LibraryMetrics:
     num_string_entries: int = 0
     num_function_name_entries: int = 0
     num_raw_entries: int = 0
-    num_shared_removed: int = 0
     total_entries: int = 0
     duration_seconds: float = 0.0
     error: Optional[str] = None
@@ -101,7 +131,6 @@ class LibraryMetrics:
             "num_string_entries": self.num_string_entries,
             "num_function_name_entries": self.num_function_name_entries,
             "num_raw_entries": self.num_raw_entries,
-            "num_shared_removed": self.num_shared_removed,
             "total_entries": self.total_entries,
             "duration_seconds": round(self.duration_seconds, 2),
             "error": self.error,
@@ -112,17 +141,12 @@ def run(
     cmd: List[str],
     cwd: Optional[pathlib.Path] = None,
     check: bool = True,
-    env: Optional[dict] = None,
 ) -> subprocess.CompletedProcess:
     """Run a subprocess and return its output."""
     logger.debug("running: %s", " ".join(cmd))
-    merged_env = os.environ.copy()
-    if env:
-        merged_env.update(env)
     result = subprocess.run(
         cmd,
         cwd=str(cwd) if cwd else None,
-        env=merged_env,
         text=True,
         capture_output=True,
     )
@@ -219,14 +243,24 @@ class Vcpkg:
             list_files = [p for p in self.info_dir.iterdir() if pattern.match(p.name)]
 
         if not list_files:
-            # Fallback: scan the whole lib directory. This is less precise but works
-            # when the .list file cannot be located.
-            logger.warning(
-                "could not find vcpkg info .list for %s:%s; falling back to lib-dir scan",
+            # The .list file is the only authoritative way to know which static
+            # libraries belong to this package. vcpkg installs every package's
+            # libs into the same shared <triplet>/lib/ directory, so a blind
+            # scan of that directory would attribute other packages'
+            # strings/functions to this library. Refuse to extract instead of
+            # silently polluting the database, and surface the files we would
+            # have wrongly included for diagnostics.
+            candidate_files = self._find_all_static_libs(triplet)
+            logger.error(
+                "could not find vcpkg info .list for %s:%s; "
+                "refusing to extract to avoid misattributing %d other-package "
+                "library file(s): %s",
                 library,
                 triplet,
+                len(candidate_files),
+                ", ".join(p.name for p in candidate_files),
             )
-            return self._find_all_static_libs(triplet)
+            return []
 
         lib_paths: List[pathlib.Path] = []
         for list_file in list_files:
@@ -310,7 +344,7 @@ class JHExtractor:
         compiler: str,
         profile: str,
     ) -> str:
-        """Run jh on a single static library and return its CSV output."""
+        """Run jh on a single static library and return its JSONL output."""
         cmd = [
             str(self.jh_path),
             triplet,
@@ -346,9 +380,15 @@ class Converter:
         jh_text: str,
         library: str,
         version: str,
-    ) -> List[dict]:
-        """Parse jh JSONL into a list of entries (within-library dedup applied if enabled)."""
+    ) -> ParseResult:
+        """Parse jh JSONL into entries and tally object/function counts in one pass.
+
+        Within-library dedup is applied to entries if enabled. Object and
+        function counts reflect the raw (pre-dedup) input, matching the
+        behavior of the previous standalone counter.
+        """
         entries: List[dict] = []
+        objects: Set[str] = set()
         function_names: Set[str] = set()
         explicit_function_names: Set[str] = set()
 
@@ -370,31 +410,14 @@ class Converter:
             if not function_name:
                 continue
 
+            objects.add(file_path)
             function_names.add(function_name)
 
             if feat_type == "string":
-                entries.append(
-                    {
-                        "string": value,
-                        "library_name": library,
-                        "library_version": version,
-                        "file_path": file_path,
-                        "function_name": function_name,
-                        "line_number": None,
-                    }
-                )
+                entries.append(make_db_entry(value, library, version, file_path, function_name))
             elif feat_type == "function_name":
                 # Future-proof: a minimal extractor may emit function names explicitly.
-                entries.append(
-                    {
-                        "string": value,
-                        "library_name": library,
-                        "library_version": version,
-                        "file_path": file_path,
-                        "function_name": value,
-                        "line_number": None,
-                    }
-                )
+                entries.append(make_db_entry(value, library, version, file_path, value))
                 explicit_function_names.add(value)
 
         # Stock jh does not emit function_name rows, so derive them from the
@@ -402,16 +425,7 @@ class Converter:
         # will be missed unless the extractor is patched to emit them.
         if self.emit_function_names:
             for fn in function_names - explicit_function_names:
-                entries.append(
-                    {
-                        "string": fn,
-                        "library_name": library,
-                        "library_version": version,
-                        "file_path": None,
-                        "function_name": fn,
-                        "line_number": None,
-                    }
-                )
+                entries.append(make_db_entry(fn, library, version, None, fn))
 
         if self.deduplicate:
             # Match loader semantics: one metadata object per unique string.
@@ -422,7 +436,11 @@ class Converter:
                     seen[key] = entry
             entries = list(seen.values())
 
-        return entries
+        return ParseResult(
+            entries=entries,
+            num_objects=len(objects),
+            num_functions=len(function_names),
+        )
 
     def write(
         self,
@@ -448,37 +466,6 @@ class Converter:
             "total_entries": len(entries),
         }
 
-    def convert(
-        self,
-        jh_text: str,
-        library: str,
-        version: str,
-        output_path: pathlib.Path,
-    ) -> dict:
-        """Convenience wrapper: parse jh JSONL and write JSONL.gz. Returns counts."""
-        entries = self.parse(jh_text, library, version)
-        return self.write(entries, output_path)
-
-
-def count_jsonl_rows(jh_text: str) -> dict:
-    """Count objects and unique functions referenced in jh JSONL output."""
-    objects: Set[str] = set()
-    functions: Set[str] = set()
-    for line in jh_text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            row = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        file_path = row.get("path")
-        function_name = row.get("function")
-        if function_name:
-            objects.add(file_path)
-            functions.add(function_name)
-    return {"num_objects": len(objects), "num_functions": len(functions)}
-
 
 def build_library(
     library: str,
@@ -492,8 +479,6 @@ def build_library(
     The returned entries are not yet written to disk; the caller is responsible
     for cross-library deduplication and final file emission.
     """
-    import time
-
     start = time.time()
     metrics = LibraryMetrics(
         library=library,
@@ -537,11 +522,10 @@ def build_library(
             all_jh_parts.append(jh_text)
 
         combined_jh_text = "\n".join(all_jh_parts)
-        row_counts = count_jsonl_rows(combined_jh_text)
-        metrics.num_objects = row_counts["num_objects"]
-        metrics.num_functions = row_counts["num_functions"]
-
-        entries = converter.parse(combined_jh_text, library, version)
+        result = converter.parse(combined_jh_text, library, version)
+        metrics.num_objects = result.num_objects
+        metrics.num_functions = result.num_functions
+        entries = result.entries
         metrics.num_raw_entries = len(entries)
     except UnsupportedPlatformError as exc:
         logger.warning("%s: skipping unsupported library (%s)", library, exc)
@@ -552,24 +536,6 @@ def build_library(
         metrics.duration_seconds = time.time() - start
 
     return metrics, entries
-
-
-def find_shared_strings(per_library_entries: Dict[str, List[dict]]) -> Set[str]:
-    """Return the set of strings that appear in two or more libraries.
-
-    A shared string cannot uniquely identify a library, so it is removed from
-    every library's database to avoid false-positive library attributions.
-    """
-    seen_in: Dict[str, str] = {}
-    shared: Set[str] = set()
-    for library, entries in per_library_entries.items():
-        for entry in entries:
-            string = entry["string"]
-            if string in seen_in and seen_in[string] != library:
-                shared.add(string)
-            else:
-                seen_in[string] = library
-    return shared
 
 
 def load_existing_entries(path: pathlib.Path) -> List[dict]:
@@ -598,25 +564,25 @@ def load_existing_entries(path: pathlib.Path) -> List[dict]:
             continue
         if not isinstance(row, dict) or "string" not in row:
             continue
+        string = row.get("string")
+        if not isinstance(string, str):
+            continue
+        library_name = row.get("library_name")
+        library_version = row.get("library_version")
+        file_path = row.get("file_path")
+        function_name = row.get("function_name")
+        line_number = row.get("line_number")
         entries.append(
-            {
-                "string": row.get("string"),
-                "library_name": row.get("library_name"),
-                "library_version": row.get("library_version"),
-                "file_path": row.get("file_path"),
-                "function_name": row.get("function_name"),
-                "line_number": row.get("line_number"),
-            }
+            make_db_entry(
+                string,
+                library_name if isinstance(library_name, str) else None,
+                library_version if isinstance(library_version, str) else None,
+                file_path if isinstance(file_path, str) else None,
+                function_name if isinstance(function_name, str) else None,
+                line_number if isinstance(line_number, int) else None,
+            )
         )
     return entries
-
-
-def write_entries(entries: List[dict], output_path: pathlib.Path) -> None:
-    """Write entries to a gzip-compressed JSONL file."""
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with gzip.open(output_path, "wt", encoding="utf-8") as f:
-        for entry in entries:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
 def merge_entries(
@@ -661,7 +627,6 @@ def write_library_database(
         logger.info("%s: removed empty database %s", metrics.library, output_path)
         metrics.num_string_entries = 0
         metrics.num_function_name_entries = 0
-        metrics.num_shared_removed = 0
         metrics.total_entries = 0
         return metrics
 
@@ -670,13 +635,117 @@ def write_library_database(
     metrics.num_function_name_entries = counts["num_function_name_entries"]
     metrics.total_entries = counts["total_entries"]
     logger.info(
-        "%s: wrote %s (%d entries, %d removed as shared with other libraries)",
+        "%s: wrote %s (%d entries)",
         metrics.library,
         output_path,
         metrics.total_entries,
-        metrics.num_shared_removed,
     )
     return metrics
+
+
+def run_build(
+    config: BuildConfig,
+    vcpkg: Vcpkg,
+    jh: JHExtractor,
+    converter: Converter,
+    build_library_fn: Callable[
+        [str, BuildConfig, Vcpkg, JHExtractor, Converter], Tuple[LibraryMetrics, List[dict]]
+    ] = build_library,
+) -> int:
+    """Build and write databases for the configured libraries.
+
+    This is split out from `main()` so tests can inject fakes directly without
+    monkeypatching module globals.
+    """
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+
+    metrics: List[LibraryMetrics] = []
+    per_library_new: Dict[str, List[dict]] = {}
+    failed = False
+    for library in config.libraries:
+        metric, entries = build_library_fn(library, config, vcpkg, jh, converter)
+        metrics.append(metric)
+        # Even on error, preserve any partial entries so they aren't lost.
+        per_library_new[library] = entries
+        if metric.error:
+            failed = True
+            if not config.continue_on_error:
+                break
+
+    # Discover all existing .jsonl.gz databases in the output directory. These
+    # include libraries we are rebuilding (whose fresh entries will be merged
+    # in) and libraries we are leaving alone. Strings are NOT deduped across
+    # libraries: a string that appears in both zlib and curl (e.g. when zlib
+    # is vendored into curl) stays in both databases. The query tagger already
+    # emits one #library tag per matching database, so the consumer can see
+    # the overlap directly.
+    existing_files = sorted(config.output_dir.glob("*.jsonl.gz"))
+
+    def _lib_name_from_path(p: pathlib.Path) -> str:
+        # p.name looks like "<lib>.jsonl.gz"; Path.stem would only strip ".gz".
+        suffix = ".jsonl.gz"
+        if p.name.endswith(suffix):
+            return p.name[: -len(suffix)]
+        return p.stem
+
+    merged: Dict[str, List[dict]] = {}
+    for path in existing_files:
+        lib = _lib_name_from_path(path)
+        existing = load_existing_entries(path)
+        if lib in per_library_new:
+            merged[lib] = merge_entries(per_library_new[lib], existing, config.deduplicate)
+        elif existing:
+            merged[lib] = existing
+
+    # Libraries being built for the first time (no pre-existing file).
+    for lib, new_entries in per_library_new.items():
+        if lib not in merged:
+            merged[lib] = list(new_entries)
+
+    # Write rebuilt libraries and update their metrics.
+    for metric in metrics:
+        if metric.error:
+            logger.warning("%s: skipping database write due to build error", metric.library)
+            continue
+        entries = merged.get(metric.library, [])
+        write_library_database(metric, entries, config.output_dir, converter)
+
+    summary = {
+        "triplet": config.triplet,
+        "compiler": config.compiler,
+        "profile": config.profile,
+        "libraries": [m.as_dict() for m in metrics],
+        "successful": sum(1 for m in metrics if not m.error),
+        "failed": sum(1 for m in metrics if m.error),
+    }
+
+    metrics_path = config.output_dir / "build_metrics.json"
+    metrics_path.write_text(json.dumps(summary, indent=2))
+    logger.info("wrote metrics to %s", metrics_path)
+
+    if failed:
+        successful = sum(1 for m in metrics if not m.error)
+        if config.continue_on_error and successful > 0:
+            # Partial success: --continue-on-error let us build some libraries.
+            # The CI will pick up the updated databases and a follow-up run can
+            # retry the failed ones.
+            logger.warning(
+                "%d/%d libraries failed; exiting 0 because --continue-on-error is set",
+                failed,
+                len(metrics),
+            )
+            return 0
+        # Either --continue-on-error was not set, or every library failed. In
+        # the latter case we cannot let the workflow step go green: nothing was
+        # produced, so a missing build (broken vcpkg, wrong jh path, etc.)
+        # would be silent.
+        logger.error(
+            "one or more libraries failed to build (failed=%d, total=%d)",
+            failed,
+            len(metrics),
+        )
+        return 1
+    return 0
 
 
 def load_config(path: pathlib.Path) -> dict:
@@ -705,9 +774,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "triplet": config.get("triplet"),
         "compiler": config.get("compiler"),
         "profile": config.get("profile"),
-        "libraries": config.get(
-            "libraries",
-        ),
+        "libraries": config.get("libraries"),
     }
 
     parser = argparse.ArgumentParser(
@@ -765,7 +832,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--no-deduplicate",
         action="store_true",
-        help="emit one JSON object per CSV row instead of one per unique string",
+        help="emit one JSON object per JSONL row instead of one per unique string",
     )
     parser.add_argument(
         "--continue-on-error",
@@ -808,141 +875,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         deduplicate=config.deduplicate,
     )
 
-    config.output_dir.mkdir(parents=True, exist_ok=True)
-
-    metrics: List[LibraryMetrics] = []
-    per_library_new: Dict[str, List[dict]] = {}
-    failed = False
-    for library in config.libraries:
-        metric, entries = build_library(library, config, vcpkg, jh, converter)
-        metrics.append(metric)
-        # Even on error, preserve any partial entries so cross-library dedup
-        # still sees them (and so partial results aren't lost).
-        per_library_new[library] = entries
-        if metric.error:
-            failed = True
-            if not config.continue_on_error:
-                break
-
-    # Discover all existing .jsonl.gz databases in the output directory. These
-    # include libraries we are rebuilding (whose fresh entries will be merged
-    # in) and libraries we are leaving alone (which still participate in
-    # cross-library dedup and may need to be rewritten if shared strings change).
-    existing_files = sorted(config.output_dir.glob("*.jsonl.gz"))
-    metric_by_lib: Dict[str, LibraryMetrics] = {m.library: m for m in metrics}
-
-    def _lib_name_from_path(p: pathlib.Path) -> str:
-        # p.name looks like "<lib>.jsonl.gz"; Path.stem would only strip ".gz".
-        suffix = ".jsonl.gz"
-        if p.name.endswith(suffix):
-            return p.name[: -len(suffix)]
-        return p.stem
-
-    merged: Dict[str, List[dict]] = {}
-    for path in existing_files:
-        lib = _lib_name_from_path(path)
-        existing = load_existing_entries(path)
-        if lib in per_library_new:
-            merged[lib] = merge_entries(per_library_new[lib], existing, config.deduplicate)
-        elif existing:
-            merged[lib] = existing
-
-    # Libraries being built for the first time (no pre-existing file).
-    for lib, new_entries in per_library_new.items():
-        if lib not in merged:
-            merged[lib] = list(new_entries)
-
-    # Cross-library dedup across the full set: rebuilt + preserved.
-    shared_strings = find_shared_strings({lib: entries for lib, entries in merged.items() if entries})
-    if shared_strings:
-        logger.info(
-            "removing %d string(s) shared across 2+ libraries from every database",
-            len(shared_strings),
-        )
-
-    # Write rebuilt libraries and update their metrics.
-    # Write rebuilt libraries and update their metrics.
-    for metric in metrics:
-        if metric.error:
-            logger.warning("%s: skipping database write due to build error", metric.library)
-            continue
-        entries = merged.get(metric.library, [])
-        if shared_strings and entries:
-            before = len(entries)
-            entries = [e for e in entries if e["string"] not in shared_strings]
-            metric.num_shared_removed = before - len(entries)
-        else:
-            metric.num_shared_removed = 0
-        write_library_database(metric, entries, config.output_dir, converter)
-    # Rewrite preserved libraries only if the cross-lib dedup actually removed
-    # something from them. (If we just rebuilt them, write_library_database
-    # already handled it above.)
-    rebuilt_libs = set(metric_by_lib.keys())
-    preserved_metrics: List[dict] = []
-    for lib in sorted(merged.keys()):
-        if lib in rebuilt_libs:
-            continue
-        entries = merged[lib]
-        filtered = [e for e in entries if e["string"] not in shared_strings] if shared_strings else list(entries)
-        if {e["string"] for e in filtered} == {e["string"] for e in entries}:
-            logger.debug("%s: unchanged, leaving %s alone", lib, f"{lib}.jsonl.gz")
-            continue
-        output_path = config.output_dir / f"{lib}.jsonl.gz"
-        if not filtered:
-            output_path.unlink(missing_ok=True)
-            logger.info("%s: removed empty database %s", lib, output_path)
-        else:
-            write_entries(filtered, output_path)
-            logger.info(
-                "%s: rewrote %s (%d entries after cross-lib dedup)",
-                lib,
-                output_path,
-                len(filtered),
-            )
-        preserved_metrics.append(
-            {
-                "library": lib,
-                "version": filtered[0]["library_version"] if filtered else None,
-                "triplet": config.triplet,
-                "num_string_entries": sum(
-                    1
-                    for e in filtered
-                    if e.get("function_name") is not None and e.get("function_name") != e.get("string")
-                ),
-                "num_function_name_entries": sum(
-                    1
-                    for e in filtered
-                    if e.get("function_name") is not None and e.get("function_name") == e.get("string")
-                ),
-                "num_raw_entries": len(entries),
-                "num_shared_removed": len(entries) - len(filtered),
-                "total_entries": len(filtered),
-                "duration_seconds": 0.0,
-                "error": None,
-            }
-        )
-
-    summary = {
-        "triplet": config.triplet,
-        "compiler": config.compiler,
-        "profile": config.profile,
-        "libraries": [m.as_dict() for m in metrics],
-        "preserved_libraries": preserved_metrics,
-        "successful": sum(1 for m in metrics if not m.error),
-        "failed": sum(1 for m in metrics if m.error),
-        "num_shared_strings_removed": len(shared_strings),
-    }
-
-    metrics_path = config.output_dir / "build_metrics.json"
-    metrics_path.write_text(json.dumps(summary, indent=2))
-    logger.info("wrote metrics to %s", metrics_path)
-
-    if failed:
-        logger.error("one or more libraries failed to build")
-        if config.continue_on_error:
-            return 0
-        return 1
-    return 0
+    return run_build(config, vcpkg, jh, converter)
 
 
 if __name__ == "__main__":

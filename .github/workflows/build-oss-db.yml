@@ -42,7 +42,7 @@ jobs:
           python-version: '3.12'
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           toolchain: stable
 
@@ -50,6 +50,11 @@ jobs:
         run: |
           cargo build --release -p lancelot-bin
         working-directory: lancelot
+
+      - name: Install flare-floss
+        run: |
+          pip install -e .
+        working-directory: flare-floss
 
       - name: Build OSS databases
         run: |
@@ -63,7 +68,11 @@ jobs:
       - name: Show metrics summary
         if: success() || failure()
         run: |
-          Get-Content floss\tags\data\oss\build_metrics.json
+          if (Test-Path floss\tags\data\oss\build_metrics.json) {
+            Get-Content floss\tags\data\oss\build_metrics.json
+          } else {
+            Write-Host "build_metrics.json not produced"
+          }
         working-directory: flare-floss
 
       - name: Show entry-level diff
@@ -116,7 +125,7 @@ jobs:
         uses: peter-evans/create-pull-request@c5a7806660adbe173f04e3e038b0ccdcd758773c # v6.1.0
         with:
           path: flare-floss
-          base: quantumstrand
+          base: master
           commit-message: 'chore(oss-db): update string databases'
           title: 'Update OSS string databases'
           # Relative to $GITHUB_WORKSPACE (not the path: checkout).

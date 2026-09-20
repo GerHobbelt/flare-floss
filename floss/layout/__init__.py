@@ -12,7 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Binary layout analysis (PE / ELF / Mach-O)."""
+"""Binary layout analysis (PE / ELF / Mach-O).
+
+Public entrypoint: ``compute_layout``. Import types, extract helpers, and
+format builders from the submodules that define them (``base``, ``extract``,
+``types``, ``pe``, ``elf``, ``macho``).
+"""
 
 from __future__ import annotations
 
@@ -23,19 +28,8 @@ from elftools.common.exceptions import ELFError
 from floss.ranges import Range, Slice
 from floss.layout.pe import compute_pe_layout
 from floss.layout.elf import compute_elf_layout
-from floss.layout.base import (
-    Layout,
-    PELayout,
-    ELFLayout,
-    Structure,
-    MachOLayout,
-    SectionLayout,
-    SegmentLayout,
-    MachOFatLayout,
-)
+from floss.layout.base import Layout, SegmentLayout
 from floss.layout.macho import _get_u32_be, _is_macho_magic, compute_macho_layout
-from floss.layout.types import Tag, TaggedString, ExtractedString
-from floss.layout.extract import MIN_STR_LEN, collect_strings, extract_strings, extract_layout_strings
 
 logger = logging.getLogger("floss.layout")
 
@@ -59,9 +53,12 @@ def compute_layout(slice_: Slice) -> Layout:
     xor_key = None
     decoded_slice = slice_
 
-    # Try to find the XOR key
+    # Try to find the XOR key. Read only the first two bytes from buf; slice_.data
+    # copies the entire underlying buffer on each call.
+    rel_start = slice_.range.offset - slice_.base_offset
+    start_bytes = slice_.buf[rel_start : rel_start + 2]
     for mz, key in mz_xor:
-        if slice_.data.startswith(mz):
+        if start_bytes == mz:
             xor_key = key
             break
 
@@ -102,26 +99,3 @@ def compute_layout(slice_: Slice) -> Layout:
         slice=slice_,
         name="binary",
     )
-
-
-__all__ = [
-    "Layout",
-    "SectionLayout",
-    "SegmentLayout",
-    "PELayout",
-    "ELFLayout",
-    "MachOLayout",
-    "MachOFatLayout",
-    "Structure",
-    "ExtractedString",
-    "TaggedString",
-    "Tag",
-    "MIN_STR_LEN",
-    "extract_strings",
-    "extract_layout_strings",
-    "collect_strings",
-    "compute_layout",
-    "compute_pe_layout",
-    "compute_elf_layout",
-    "compute_macho_layout",
-]

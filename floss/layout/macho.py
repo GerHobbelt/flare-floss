@@ -41,32 +41,6 @@ FAT_CIGAM_64 = 0xBFBAFECA
 MACHO_MAGICS = {MACHO_MAGIC, MACHO_CIGAM, MACHO_MAGIC_64, MACHO_CIGAM_64}
 FAT_MAGICS = {FAT_MAGIC, FAT_CIGAM, FAT_MAGIC_64, FAT_CIGAM_64}
 
-PE_RESOURCE_TYPES = {
-    1: "Cursors",
-    2: "Bitmaps",
-    3: "Icons",
-    4: "Menus",
-    5: "Dialogs",
-    6: "String Tables",
-    7: "Font Directories",
-    8: "Fonts",
-    9: "Accelerators",
-    10: "RCData",
-    11: "Message Tables",
-    12: "Cursor Groups",
-    14: "Icon Groups",
-    16: "Version Info",
-    17: "DLGInclude",
-    19: "Plug and Play",
-    20: "VXD",
-    21: "Animated Cursors",
-    22: "Animated Icons",
-    23: "HTML",
-    24: "Manifest",
-    240: "DLGInit",  # MFC specific
-    241: "Toolbars",  # MFC specific
-}
-
 CPU_TYPE_X86 = 0x7
 CPU_TYPE_X86_64 = 0x1000007
 CPU_TYPE_ARM = 0xC
@@ -189,6 +163,7 @@ def _parse_macho_load_commands(
     segments: List[Dict[str, int]] = []
     code_sig: Optional[Tuple[int, int]] = None
 
+    data = slice_.data
     header_size = 32 if is_64 else 28
     if slice_.range.length >= header_size:
         structures.append(Structure(slice=slice_.slice(0, header_size), name="macho header"))
@@ -201,7 +176,7 @@ def _parse_macho_load_commands(
         if offset + cmd_header_size > slice_.range.length:
             break
 
-        cmd, cmdsize = struct.unpack(endian + "II", slice_.data[offset : offset + cmd_header_size])
+        cmd, cmdsize = struct.unpack(endian + "II", data[offset : offset + cmd_header_size])
         if cmdsize < cmd_header_size:
             break
 
@@ -214,13 +189,13 @@ def _parse_macho_load_commands(
 
         if cmd == LC_CODE_SIGNATURE:
             if cmdsize >= 16:
-                dataoff = struct.unpack(endian + "I", slice_.data[cmd_offset + 8 : cmd_offset + 12])[0]
-                datasize = struct.unpack(endian + "I", slice_.data[cmd_offset + 12 : cmd_offset + 16])[0]
+                dataoff = struct.unpack(endian + "I", data[cmd_offset + 8 : cmd_offset + 12])[0]
+                datasize = struct.unpack(endian + "I", data[cmd_offset + 12 : cmd_offset + 16])[0]
                 code_sig = (int(dataoff), int(datasize))
 
         if cmd in {LC_SEGMENT, LC_SEGMENT_64}:
             if cmdsize >= seg_header_size:
-                seg_data = slice_.data[cmd_offset : cmd_offset + seg_header_size]
+                seg_data = data[cmd_offset : cmd_offset + seg_header_size]
                 seg_values = struct.unpack(endian + seg_fmt, seg_data)
                 segname = seg_values[2].split(b"\x00", 1)[0].decode("utf-8", errors="replace")
                 fileoff = seg_values[5]

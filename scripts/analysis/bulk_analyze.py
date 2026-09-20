@@ -18,8 +18,8 @@ import pathlib
 import argparse
 import subprocess
 
-import floss.main
-import floss.quantum
+from floss.cli import set_log_config
+from floss.layout.extract import MIN_STR_LEN
 
 logger = logging.getLogger("floss.bulk")
 
@@ -33,7 +33,7 @@ def main():
         "--minimum-length",
         dest="min_length",
         type=int,
-        default=floss.quantum.MIN_STR_LEN,
+        default=MIN_STR_LEN,
         help="Minimum string length.",
     )
     parser.add_argument(
@@ -54,7 +54,7 @@ def main():
     )
     args = parser.parse_args()
 
-    floss.main.set_log_config(args.debug, args.quiet)
+    set_log_config(args.debug, args.quiet)
 
     if not args.input_directory.is_dir():
         logger.error("Input path %s is not a directory.", args.input_directory)
@@ -85,7 +85,11 @@ def main():
             cmd = [
                 sys.executable,
                 "-m",
-                "floss.quantum",
+                "floss.main",
+                "--no",
+                "stack",
+                "tight",
+                "decoded",
                 str(file_path),
                 "--json",
                 "-n",
@@ -107,9 +111,9 @@ def main():
                         cmd_render = [
                             sys.executable,
                             "-m",
-                            "floss.quantum",
-                            str(json_output_path),
+                            "floss.main",
                             "--load",
+                            str(json_output_path),
                         ]
                         if args.quiet:
                             cmd_render.append("--quiet")
@@ -147,9 +151,9 @@ def main():
             cmd = [
                 sys.executable,
                 "-m",
-                "floss.quantum",
-                str(json_output_path),
+                "floss.main",
                 "--load",
+                str(json_output_path),
             ]
             if args.quiet:
                 cmd.append("--quiet")

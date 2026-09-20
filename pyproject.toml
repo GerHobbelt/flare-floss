@@ -117,8 +117,15 @@ dynamic = ["version", "readme"]
 version = {attr = "floss.version.__version__"}
 readme = {file = "README.md", content-type = "text/markdown"}
 
-[tool.setuptools]
-packages = ["floss", "floss.sigs"]
+[tool.pytest.ini_options]
+# so tests can import scripts.tags.* (scripts is not an installed package)
+pythonpath = ["."]
+
+[tool.setuptools.packages.find]
+include = ["floss*"]
+
+[tool.setuptools.package-data]
+"floss" = ["sigs/*", "tags/data/**/*"]
 
 [project.optional-dependencies]
 # Dev and build dependencies are not relaxed because
@@ -155,4 +162,3 @@ Signatures = "https://github.com/mandiant/flare-floss/tree/master/floss/sigs"
 
 [project.scripts]
 floss = "floss.main:main"
-quantum = "floss.quantum:main"

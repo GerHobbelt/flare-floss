@@ -19,6 +19,16 @@ load on-disk classification databases and expose query interfaces. ``engine`` wi
 those into ``Tagger`` callables, including layout-derived tags (#code, etc.).
 """
 
+from __future__ import annotations
+
+import pathlib
+
+
+def data_root() -> pathlib.Path:
+    """Shipped tag databases under floss/tags/data."""
+    return pathlib.Path(__file__).resolve().parent / "data"
+
+
 from floss.tags.engine import (
     Tagger,
     load_databases,
@@ -37,13 +47,3 @@ from floss.tags.filter import (
 )
 
 load_taggers = load_databases
-
-__all__ = [
-    "Tagger",
-    "load_databases",
-    "load_taggers",
-    "TagRules",
-    "remove_false_positive_lib_strings",
-    "hide_strings_by_rules",
-    "should_hide_string",
-]

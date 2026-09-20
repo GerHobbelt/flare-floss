@@ -84,7 +84,7 @@ x64-windows-static,msvc143,bzip2,1.0.8#3,release,CMakeFiles/bz2.dir/bzlib.c.obj,
 For example, to invoke jh:
 
 ```console
-$ ~/lancelot/target/release/jh x64-windows-static msvc143 zlib 1.2.13 release /mnt/c/vcpkg/installed/x64-windows-static/lib/zlib.lib > ~/flare-floss/floss/qs/db/data/oss/zlib.csv
+$ ~/lancelot/target/release/jh x64-windows-static msvc143 zlib 1.2.13 release /mnt/c/vcpkg/installed/x64-windows-static/lib/zlib.lib > ~/flare-floss/floss/tags/data/oss/zlib.csv
 ```
 
 ### Convert to OSS database format
@@ -101,7 +101,7 @@ These files are then gzip'd:
 $  gzip -c zlib.jsonl > zlib.jsonl.gz
 ```
 
-The `build_oss_db.py` script automates the steps above and merges into
+The `scripts/tags/build_oss_db.py` script automates the steps above and merges into
 any `.jsonl.gz` already present in the output directory rather than
 replacing them. For each library being rebuilt, the newly-extracted
 entries are combined with the existing entries (new entries win on

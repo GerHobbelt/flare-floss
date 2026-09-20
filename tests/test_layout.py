@@ -24,7 +24,7 @@ from floss.enrich import static_strings_from_layout
 from floss.layout import compute_layout
 from floss.ranges import Slice
 from floss.results import Strings, Analysis, Metadata, ResultLayout, ResultDocument
-from floss.layout.extract import collect_strings, extract_layout_strings
+from floss.layout.extract import collect_strings
 
 CD = Path(__file__).resolve().parent
 MIN_STR_LEN = 6
@@ -39,12 +39,12 @@ def pma_binary_path():
 def analyzed_layout(pma_binary_path):
     slice_buf = pma_binary_path.read_bytes()
     file_slice = Slice.from_bytes(slice_buf)
-    layout = compute_layout(file_slice)
-    extract_layout_strings(layout, 6)
+    parsed = compute_layout(file_slice)
+    parsed.extract_strings(6)
     taggers = load_databases()
-    layout.tag_strings(taggers)
-    layout.mark_structures()
-    return layout
+    parsed.tag_strings(taggers)
+    parsed.mark_structures()
+    return parsed
 
 
 def test_round_trip(analyzed_layout, pma_binary_path):
@@ -74,23 +74,14 @@ def test_round_trip(analyzed_layout, pma_binary_path):
         path.unlink()
 
     # show the round trip works
-    # first by comparing key fields after JSON serialize/parse
-    # (full ResultDocument equality is not used: nested Runtime timestamps and
-    #  similar fields can differ in representation after a round-trip)
-    assert one.metadata.file_path == two.metadata.file_path
-    assert one.layout is not None and two.layout is not None
-    assert one.layout.name == two.layout.name
-    assert len(one.strings.static_strings) == len(two.strings.static_strings)
-    assert one.strings.static_strings[0].tags == two.strings.static_strings[0].tags
-    # second by showing layout/tag content survived in the parsed document
-    assert two.layout.name == layout_doc.name
-    assert two.strings.static_strings[0].tags == statics[0].tags
+    assert one == two
+    assert floss.render.json.render(one) == floss.render.json.render(two)
 
     # now show that two different versions are not equal.
     three = copy.deepcopy(two)
     three.metadata.version = "0"
-    assert one.metadata.version != three.metadata.version
-    assert floss.render.json.render(one) != floss.render.json.render(three)
+    assert two.metadata.version != three.metadata.version
+    assert floss.render.json.render(two) != floss.render.json.render(three)
 
 
 def test_string_extraction(analyzed_layout):
@@ -120,8 +111,8 @@ def test_analysis_pipeline(pma_binary_path):
     # Run the analysis pipeline
     slice_buf = pma_binary_path.read_bytes()
     file_slice = Slice.from_bytes(slice_buf)
-    layout = compute_layout(file_slice)
-    extract_layout_strings(layout, 6)
+    parsed = compute_layout(file_slice)
+    parsed.extract_strings(6)
 
     # Check that the layout has been computed correctly
-    assert layout.name == "pe"
+    assert parsed.name == "pe"

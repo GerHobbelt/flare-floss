@@ -15,6 +15,7 @@
 import os
 import re
 import sys
+import json
 import mmap
 import time
 import inspect
@@ -22,6 +23,7 @@ import logging
 import argparse
 import builtins
 import contextlib
+from enum import Enum
 from typing import Set, Tuple, Iterable, Optional
 from pathlib import Path
 from collections import OrderedDict
@@ -37,7 +39,14 @@ from envi import Emulator
 import floss.strings
 import floss.logging_
 
-from .const import MEGABYTE, MOD_NAME, MAX_STRING_LENGTH
+from .const import (
+    MEGABYTE,
+    MOD_NAME,
+    MAX_STRING_LENGTH,
+    UNSUPPORTED_FILE_MAGIC,
+    SUPPORTED_FILE_MAGIC_PE,
+    SUPPORTED_FILE_MAGIC_ELF,
+)
 from .results import StaticString
 from .strings import extract_ascii_unicode_strings
 from .api_hooks import ENABLED_VIV_DEFAULT_HOOKS
@@ -45,6 +54,60 @@ from .api_hooks import ENABLED_VIV_DEFAULT_HOOKS
 STACK_MEM_NAME = "[stack]"
 
 logger = floss.logging_.getLogger(__name__)
+
+
+class FileType(str, Enum):
+    """
+    The kind of a file, detected from its content.
+    """
+
+    PE = "pe"
+    ELF = "elf"
+    UNSUPPORTED = "unsupported"
+    RESULTS = "results"  # a saved FLOSS results document
+
+
+def detect_file_type(sample: Path) -> FileType:
+    """
+    Detect the kind of a file from its content.
+
+    A saved FLOSS results document is a JSON object with the top-level
+    ResultDocument fields metadata, analysis, and strings. The top-level
+    schema is stable across the migration iterations, so this check does not
+    need a version.
+
+    Binary samples are rejected cheaply by peeking the first non-whitespace
+    byte. The full file is loaded and parsed only when the content looks
+    like JSON, so large binaries are not read for the check.
+    """
+    with sample.open("rb") as f:
+        magic = f.read(4)
+
+    if magic == SUPPORTED_FILE_MAGIC_ELF:
+        return FileType.ELF
+    elif magic[:2] == SUPPORTED_FILE_MAGIC_PE:
+        return FileType.PE
+
+    try:
+        with sample.open("rb") as f:
+            for byte in iter(lambda: f.read(1), b""):
+                if not byte.strip():
+                    continue
+                if byte != b"{":
+                    return FileType.UNSUPPORTED
+                break
+    except OSError:
+        return FileType.UNSUPPORTED
+
+    try:
+        data = json.loads(sample.read_bytes())
+    except (OSError, ValueError):
+        return FileType.UNSUPPORTED
+
+    if isinstance(data, dict) and all(k in data for k in ("metadata", "analysis", "strings")):
+        return FileType.RESULTS
+
+    return FileType.UNSUPPORTED
 
 
 class InstallContextMenu(argparse.Action):
@@ -471,11 +534,11 @@ def get_call_funcname(api):
     return api[3]
 
 
-def is_string_type_enabled(type_, disabled_types, enabled_types):
-    if disabled_types:
-        return type_ not in disabled_types
-    elif enabled_types:
-        return type_ in enabled_types
+def is_string_type_enabled(type_, disabled_string_types, enabled_string_types):
+    if disabled_string_types:
+        return type_ not in disabled_string_types
+    elif enabled_string_types:
+        return type_ in enabled_string_types
     else:
         return True
 
@@ -602,23 +665,13 @@ def read_memory(vw, va: int, size: int) -> bytes:
     raise envi.exc.SegmentationViolation(va)
 
 
-def get_static_strings_from_bytes(buf: bytes, min_length: int) -> list:
-    """
-    Returns list of static strings from a buffer which are above the minimum length.
-    """
-    if not buf:
-        logger.warning("File is empty")
-        return []
-    return list(extract_ascii_unicode_strings(buf, min_length))
-
-
 def get_static_strings(sample: Path, min_length: int) -> list:
     """
     Returns list of static strings from the file which are above the minimum length
     """
 
     if sample.stat().st_size == 0:
-        logger.warning("File is empty")
+        logger.warning("file is empty")
         return []
 
     with sample.open("rb") as f:

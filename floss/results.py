@@ -15,9 +15,11 @@
 
 import re
 import json
+import time
 import datetime
+import contextlib
 from enum import Enum
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Iterator, Optional
 from pathlib import Path
 from dataclasses import field
 
@@ -199,7 +201,7 @@ class ResultLayout:
 
     @classmethod
     def from_layout(cls, layout: "Layout") -> "ResultLayout":
-        """Recursively convert a live Layout tree to the serializable form."""
+        """Recursively convert a layout tree to the serializable form."""
         from floss.layout.types import TaggedString, ExtractedString
 
         result_strings: List[ResultString] = []
@@ -239,15 +241,28 @@ class ResultLayout:
 
 @dataclass
 class Runtime:
-    start_date: datetime.datetime = datetime.datetime.now()
-    total: float = 0
-    vivisect: float = 0
-    find_features: float = 0
-    static_strings: float = 0
-    language_strings: float = 0
-    stack_strings: float = 0
-    decoded_strings: float = 0
-    tight_strings: float = 0
+    start_date: datetime.datetime = field(default_factory=lambda: datetime.datetime.now(datetime.timezone.utc))
+    total: float = 0.0
+    vivisect: float = 0.0
+    find_features: float = 0.0
+    static_strings: float = 0.0
+    layout: float = 0.0
+    tags: float = 0.0
+    language_strings: float = 0.0
+    stack_strings: float = 0.0
+    decoded_strings: float = 0.0
+    tight_strings: float = 0.0
+
+    @contextlib.contextmanager
+    def measure_and_set_time(self, field: str) -> Iterator[None]:
+        """
+        Record the elapsed time of the wrapped block into the given runtime field.
+        """
+        t0 = time.time()
+        try:
+            yield
+        finally:
+            setattr(self, field, round(time.time() - t0, 4))
 
 
 @dataclass
@@ -283,6 +298,9 @@ STRING_TYPE_FIELDS = {
 @dataclass
 class Metadata:
     file_path: str
+    md5: str = ""
+    sha1: str = ""
+    sha256: str = ""
     version: str = __version__
     imagebase: int = 0
     min_length: int = 0
@@ -343,10 +361,6 @@ def load(sample: Path, analysis: Analysis, functions: List[int], min_length: int
     logger.debug("loading results document: %s", str(sample))
     results = read(sample)
     results.metadata.file_path = f"{sample}\n{results.metadata.file_path}"
-    # TODO(#1348): apply enable_layout / enable_tags from ``analysis`` on load.
-    # Today only string-type flags are applied (check_set_string_types). A JSON
-    # saved with a layout tree still renders layout UI under ``floss --load``
-    # even when the user passes --no-layout (results.layout is not cleared).
     check_set_string_types(results, analysis)
     if functions:
         filter_functions(results, functions)
@@ -374,7 +388,9 @@ def read(sample: Path) -> ResultDocument:
 def check_set_string_types(results: ResultDocument, wanted_analysis: Analysis) -> None:
     for string_type in STRING_TYPE_FIELDS:
         if getattr(wanted_analysis, string_type) and not getattr(results.analysis, string_type):
-            logger.warning(f"{string_type} not in loaded data, use --only/--no to enable/disable type(s)")
+            logger.warning(
+                f"{string_type} not in loaded data, use --string-type/--no-string-type to enable/disable type(s)"
+            )
         setattr(results.analysis, string_type, getattr(wanted_analysis, string_type))
 
 

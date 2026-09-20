@@ -81,11 +81,23 @@ def render_meta(results: ResultDocument, console, verbose):
 
     if verbose == Verbosity.DEFAULT:
         rows.append((width("file path", MIN_WIDTH_LEFT_COL), width(results.metadata.file_path, MIN_WIDTH_RIGHT_COL)))
+        if results.metadata.sha256:
+            rows.append(("sha256", results.metadata.sha256))
         rows.append(("identified language", language_value))
     else:
         rows.extend(
             [
                 (width("file path", MIN_WIDTH_LEFT_COL), width(results.metadata.file_path, MIN_WIDTH_RIGHT_COL)),
+            ]
+        )
+        if results.metadata.md5:
+            rows.append(("md5", results.metadata.md5))
+        if results.metadata.sha1:
+            rows.append(("sha1", results.metadata.sha1))
+        if results.metadata.sha256:
+            rows.append(("sha256", results.metadata.sha256))
+        rows.extend(
+            [
                 ("start date", results.metadata.runtime.start_date.strftime("%Y-%m-%d %H:%M:%S")),
                 ("runtime", strtime(results.metadata.runtime.total)),
                 ("version", results.metadata.version),
@@ -346,8 +358,6 @@ def render(results: floss.results.ResultDocument, verbose, disable_headers, colo
     console = Console(file=io.StringIO(), color_system=get_color(color), highlight=False, soft_wrap=True)
 
     # layout-aware path: no classic meta table (quantum-style)
-    # TODO(#1348): --load + --no-layout still hits this branch when the JSON
-    # already contains a layout tree (load does not clear results.layout).
     if results.layout is not None and results.analysis.enable_static_strings:
         layout_view = hide_strings_by_rules(results.layout, DEFAULT_TAG_RULES)
         render_strings(console, layout_view, DEFAULT_TAG_RULES)

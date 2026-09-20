@@ -21,6 +21,7 @@ import subprocess
 from floss.cli import set_log_config
 from floss.layout.extract import MIN_STR_LEN
 
+# TODO: full deobf when those strings are first-class in layout output)
 logger = logging.getLogger("floss.bulk")
 
 
@@ -86,11 +87,11 @@ def main():
                 sys.executable,
                 "-m",
                 "floss.main",
+                str(file_path),
                 "--no",
                 "stack",
                 "tight",
                 "decoded",
-                str(file_path),
                 "--json",
                 "-n",
                 str(args.min_length),
@@ -112,7 +113,6 @@ def main():
                             sys.executable,
                             "-m",
                             "floss.main",
-                            "--load",
                             str(json_output_path),
                         ]
                         if args.quiet:
@@ -152,7 +152,6 @@ def main():
                 sys.executable,
                 "-m",
                 "floss.main",
-                "--load",
                 str(json_output_path),
             ]
             if args.quiet:

@@ -17,33 +17,35 @@
 The summary is built from the same ``ResultDocument`` as the ``--json`` output,
 so it is programmatic and consistent. It reports sample metadata, per-type
 string counts, section counts, tag histograms, and the strings that carry
-high-value (non-noisy) tags. Meant for human consumers and agents, so it is
-pretty printed with tables.
+high-value (non-noisy) tags. Intended for human consumers: agents should use
+``-j/--json`` for machine-readable output instead of parsing the formatted
+tables.
 """
 
 from __future__ import annotations
 
 import io
 import sys
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Sequence
 from collections import Counter
 
-from rich import box
 from rich.markup import escape
-from rich.table import Table
 from rich.console import Console
 
 from floss.results import ResultLayout, ResultString, ResultDocument
-from floss.render.filter import NOISY_TAGS, is_arch_wrapper
-from floss.render.sanitize import sanitize
+from floss.render.filter import NOISY_TAGS, relevance_key, is_section_child
+from floss.render.layout import get_visible_tags
 from floss.render.default import (
+    DEFAULT_TAG_RULES,
     MIN_WIDTH_LEFT_COL,
     MIN_WIDTH_RIGHT_COL,
     width,
     strtime,
     get_color,
+    heading_style,
     language_value,
 )
+from floss.render.sanitize import sanitize
 
 HIGH_VALUE_MAX_STRINGS = 25
 
@@ -68,9 +70,7 @@ def analyze_layout(layout: ResultLayout):
             if any(tag not in NOISY_TAGS for tag in s.tags):
                 high_value.append(s)
         for child in node.children:
-            # a child becomes a section when it's not a format wrapper and its
-            # parent is the root or an arch wrapper; otherwise it inherits
-            if not is_arch_wrapper(child) and (depth == 0 or is_arch_wrapper(node)):
+            if is_section_child(node, child, depth):
                 child_section = child.name
             else:
                 child_section = section
@@ -81,7 +81,7 @@ def analyze_layout(layout: ResultLayout):
     walk(layout, layout.name, 0)
 
     hist = sorted(tag_histogram.items(), key=lambda kv: (-kv[1], kv[0]))
-    high_value.sort(key=lambda s: (-len(s.tags), s.offset))
+    high_value.sort(key=lambda s: relevance_key(s, DEFAULT_TAG_RULES))
     return dict(section_counts), hist, high_value
 
 
@@ -111,16 +111,22 @@ def metadata_rows(results: ResultDocument) -> List[Tuple[str, str]]:
 
 def counts_rows(results: ResultDocument) -> List[Tuple[str, int]]:
     strings = results.strings
+    a = results.analysis
     return [
-        ("static strings", len(strings.static_strings)),
-        (
-            "language strings",
-            len(strings.language_strings) if results.analysis.enable_language_strings else 0,
-        ),
-        ("stack strings", len(strings.stack_strings)),
-        ("tight strings", len(strings.tight_strings)),
-        ("decoded strings", len(strings.decoded_strings)),
+        ("static strings", len(strings.static_strings) if a.enable_static_strings else 0),
+        ("language strings", len(strings.language_strings) if a.enable_language_strings else 0),
+        ("stack strings", len(strings.stack_strings) if a.enable_stack_strings else 0),
+        ("tight strings", len(strings.tight_strings) if a.enable_tight_strings else 0),
+        ("decoded strings", len(strings.decoded_strings) if a.enable_decoded_strings else 0),
     ]
+
+
+def render_pipe_table(rows: Sequence[Tuple[str, object]]) -> str:
+    """render a two-column table with markdown-style pipe separators.
+
+    agents can parse the output without rich box-drawing characters.
+    """
+    return "\n".join("| %s | %s |" % (left, right) for left, right in rows)
 
 
 def render_summary(results: ResultDocument, color: str = "auto") -> str:
@@ -134,46 +140,36 @@ def render_summary(results: ResultDocument, color: str = "auto") -> str:
 
     console.print(f"FLOSS SUMMARY (version {results.metadata.version})\n")
 
-    console.print("[cyan]sample[/cyan]")
-    meta_table = Table(box=box.ASCII2, show_header=False)
-    for left, right in metadata_rows(results):
-        meta_table.add_row(left, right)
-    console.print(meta_table)
+    console.print(heading_style("sample"))
+    console.print(render_pipe_table(metadata_rows(results)))
     console.print()
 
-    console.print("[cyan]string counts[/cyan]")
-    counts_table = Table(box=box.ASCII2, show_header=False)
-    for label, count in counts_rows(results):
-        counts_table.add_row(width(label, MIN_WIDTH_LEFT_COL), str(count))
-    console.print(counts_table)
+    console.print(heading_style("string counts"))
+    console.print(render_pipe_table(counts_rows(results)))
     console.print()
 
-    if results.layout is not None:
+    # the layout tree is the static-string view; only shown when statics are on
+    if results.layout is not None and results.analysis.enable_static_strings:
         section_counts, tag_hist, high_value = analyze_layout(results.layout)
 
-        console.print("[cyan]section counts[/cyan]")
-        section_table = Table(box=box.ASCII2, show_header=False)
-        for section, count in section_counts.items():
-            section_table.add_row(width(section, MIN_WIDTH_LEFT_COL), str(count))
-        console.print(section_table)
+        console.print(heading_style("section counts"))
+        console.print(render_pipe_table(list(section_counts.items())))
         console.print()
 
         if tag_hist:
-            console.print("[cyan]tag histogram[/cyan]")
-            tag_table = Table(box=box.ASCII2, show_header=False)
-            for tag, count in tag_hist:
-                tag_table.add_row(width(tag, MIN_WIDTH_LEFT_COL), str(count))
-            console.print(tag_table)
+            console.print(heading_style("tag histogram"))
+            console.print(render_pipe_table(tag_hist))
             console.print()
 
         if high_value:
-            console.print("[cyan]high-value strings[/cyan]")
-            high_table = Table("tag", "offset", "string", show_header=True, box=box.ASCII2, show_edge=False)
+            console.print(heading_style("high-value strings"))
+            console.print("| tag | offset | string |")
+            console.print("|---|---|---|")
             for s in high_value[:HIGH_VALUE_MAX_STRINGS]:
                 # escape Rich markup and control chars so binary strings render
                 # as literal text instead of crashing or breaking the table
-                high_table.add_row(", ".join(sorted(s.tags)), f"0x{s.offset:x}", escape(sanitize(s.string)))
-            console.print(high_table)
+                tags = ", ".join(get_visible_tags(s))
+                console.print("| %s | 0x%x | %s |" % (tags, s.offset, escape(sanitize(s.string))))
             if len(high_value) > HIGH_VALUE_MAX_STRINGS:
                 console.print(f"... and {len(high_value) - HIGH_VALUE_MAX_STRINGS} more high-value strings")
 

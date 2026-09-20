@@ -32,8 +32,8 @@ from floss.results import (
     StringEncoding,
 )
 from floss.tags.filter import TagRules
-from floss.render.default import render
 from floss.render.layout import render_strings
+from floss.render.default import render
 
 
 def make_layout() -> ResultLayout:
@@ -262,6 +262,15 @@ def test_filter_by_structure_slug_variants():
         assert strings == ["CreateFileA"], slug
 
 
+def test_filter_no_structure():
+    """--no-structure drops strings in the given structure and keeps the rest."""
+    f = floss.render.filter.LayoutFilter(exclude_structures=["import-table"])
+    filtered = f.apply(make_layout())
+    strings = collect_layout_strings(filtered)
+    assert "CreateFileA" not in strings
+    assert "hello world" in strings
+
+
 def test_filter_by_tag():
     f = floss.render.filter.LayoutFilter(include_tags=["winapi"])
     filtered = f.apply(make_layout())
@@ -294,6 +303,23 @@ def test_filter_oss_meta_tag():
     assert strings == ["kcp://url"]
 
 
+def test_filter_tag_family_gp():
+    """the gp tag family matches global-prevalence tags like #common."""
+    f = floss.render.filter.LayoutFilter(include_tags=["gp"])
+    filtered = f.apply(make_layout())
+    strings = collect_layout_strings(filtered)
+    assert strings == ["hello world"]
+
+
+def test_filter_tag_normalization():
+    """--tag input is case- and #-insensitive (#WinAPI and WinAPI match #winapi)."""
+    for tag in ("#WINAPI", "WinAPI", "#winapi", "winapi"):
+        f = floss.render.filter.LayoutFilter(include_tags=[tag])
+        filtered = f.apply(make_layout())
+        strings = collect_layout_strings(filtered)
+        assert strings == ["CreateFileA"], tag
+
+
 def test_filter_interesting():
     f = floss.render.filter.LayoutFilter(interesting=True)
     filtered = f.apply(make_layout())
@@ -305,21 +331,22 @@ def test_filter_interesting():
     assert "kcp://url" in strings
 
 
-def test_filter_interesting_keeps_strings_with_non_noisy_tag():
-    """a string with both a noisy and a non-noisy tag is kept."""
+def test_filter_interesting_drops_strings_with_any_noisy_tag():
+    """--interesting drops a string if it carries any noisy tag, even alongside
+    a non-noisy tag (e.g. #winapi #common is dropped)."""
     layout = ResultLayout(
         name=".rdata",
         offset=0,
         length=0x10,
         strings=[
             ResultString(string="CreateFileA", offset=1, size=11, encoding="ascii", tags=["#winapi", "#common"]),
-            ResultString(string="only noisen", offset=2, size=11, encoding="ascii", tags=["#common", "#code"]),
+            ResultString(string="only winapi", offset=2, size=11, encoding="ascii", tags=["#winapi"]),
         ],
     )
     f = floss.render.filter.LayoutFilter(interesting=True)
     filtered = f.apply(layout)
     assert filtered is not None
-    assert [s.string for s in filtered.strings] == ["CreateFileA"]
+    assert [s.string for s in filtered.strings] == ["only winapi"]
 
 
 def test_filter_query():
@@ -406,6 +433,21 @@ def test_columns_show_structure():
     assert "import table" in out
 
 
+def test_columns_encoding():
+    """--columns encoding renders U for unicode strings and nothing for ascii."""
+    unicode_s = ResultString(string="héllo", offset=1, size=6, encoding="unicode")
+    ascii_s = ResultString(string="ascii", offset=2, size=5, encoding="ascii")
+    doc = ResultDocument(
+        metadata=Metadata(file_path="x", min_length=4),
+        analysis=Analysis(enable_stack_strings=False, enable_tight_strings=False, enable_decoded_strings=False),
+        strings=Strings(),
+        layout=ResultLayout(name="pe", offset=0, length=10, strings=[unicode_s, ascii_s]),
+    )
+    out = render(doc, True, False, "auto", columns=["encoding"])
+    # unicode marker rendered, ascii marker absent (rich trims the trailing space)
+    assert "U" in out
+
+
 def test_filter_all_removed_renders_empty():
     """a filter that matches nothing must not fall back to the unfiltered layout."""
     f = floss.render.filter.LayoutFilter(include_tags=["#nonexistent"])
@@ -416,8 +458,8 @@ def test_filter_all_removed_renders_empty():
 
 
 def test_tag_filter_overrides_default_hide_rules():
-    """--tag code / --tag winapi / --interesting must show strings that carry a
-    hide-rule tag (#code/#reloc) which the default render would suppress."""
+    """--tag code / --tag winapi must show strings that carry a hide-rule tag
+    (#code/#reloc) which the default render would suppress."""
     layout = ResultLayout(
         name=".rdata",
         offset=0,
@@ -433,13 +475,19 @@ def test_tag_filter_overrides_default_hide_rules():
         layout=layout,
     )
 
-    for kwargs in (
-        {"include_tags": ["code"]},
-        {"include_tags": ["winapi"]},
-        {"interesting": True},
-    ):
-        out = render(doc, True, False, "auto", layout_filter=floss.render.filter.LayoutFilter(**kwargs))
-        assert "junk code" in out, kwargs
+    for include in ("code", "winapi"):
+        out = render(
+            doc,
+            True,
+            False,
+            "auto",
+            layout_filter=floss.render.filter.LayoutFilter(include_tags=[include]),
+        )
+        assert "junk code" in out, include
+
+    # --interesting drops any string carrying a noisy tag, including #code
+    out = render(doc, True, False, "auto", layout_filter=floss.render.filter.LayoutFilter(interesting=True))
+    assert "junk code" not in out
 
     # without a tag filter, the default hide rules still suppress #code strings
     out = render(doc, True, False, "auto")
@@ -480,11 +528,63 @@ def test_summary_section_counts_thread_top_level():
     assert sum(counts.values()) == 3
 
 
+def test_summary_section_counts_thread_fat_macho():
+    """on a fat Mach-O, strings under an arch wrapper's segments count under
+    their segment (__TEXT), while the wrapper's own strings count under the
+    root."""
+    root_s = ResultString(string="root", offset=1, size=4, encoding="ascii")
+    wrapper_s = ResultString(string="wrapper", offset=2, size=7, encoding="ascii")
+    text_s = ResultString(string="text", offset=3, size=4, encoding="ascii")
+    layout = ResultLayout(
+        name="macho (fat)",
+        offset=0,
+        length=20,
+        strings=[root_s],
+        children=[
+            ResultLayout(
+                name="macho: x86_64",
+                offset=0,
+                length=10,
+                strings=[wrapper_s],
+                children=[
+                    ResultLayout(name="__TEXT", offset=0, length=10, strings=[text_s]),
+                ],
+            )
+        ],
+    )
+    counts, _, _ = floss.render.summary.analyze_layout(layout)
+    assert counts == {"macho (fat)": 2, "__TEXT": 1}
+    assert sum(counts.values()) == 3
+
+
 def test_main_summary_flag(exefile, capsys):
-    assert floss.main.main([exefile, "--summary", "--no-string-type", "stack", "tight", "decoded"]) == 0
+    assert floss.main.main([exefile, "--summary"]) == 0
     out = capsys.readouterr().out
     assert "FLOSS SUMMARY" in out
     assert "string counts" in out
+
+
+def test_main_summary_is_static_only_by_default(exefile, capsys):
+    """--summary alone skips stack/tight/decoded extraction."""
+    assert floss.main.main([exefile, "--summary"]) == 0
+    out = capsys.readouterr().out
+    assert "FLOSS SUMMARY" in out
+    # counts show recovered strings as 0 because they were not extracted
+    assert "| stack strings | 0 |" in out
+
+
+def test_main_summary_rejects_non_static_string_type(exefile, capsys):
+    """--summary only covers static strings, so non-static types are rejected."""
+    assert floss.main.main([exefile, "--summary", "--string-type", "stack", "tight", "decoded"]) == -1
+    err = capsys.readouterr().err
+    assert "--summary" in err
+
+
+def test_main_summary_accepts_explicit_static(exefile, capsys):
+    """--summary with an explicit static selection is fine."""
+    assert floss.main.main([exefile, "--summary", "--string-type", "static"]) == 0
+    out = capsys.readouterr().out
+    assert "FLOSS SUMMARY" in out
 
 
 def test_summary_no_layout_ok():
@@ -516,8 +616,8 @@ def test_main_invalid_query_regex_json_error(capsys, exefile):
 def test_main_invalid_query_regex_text_error(capsys, exefile):
     assert floss.main.main([exefile, "--query", "["]) == -1
     captured = capsys.readouterr()
-    # the error message goes to stdout; stderr only carries the usage text
-    assert "invalid --query regular expression" in captured.out
+    # the error message and usage both go to stderr in text mode
+    assert "invalid --query regular expression" in captured.err
     assert "usage:" in captured.err
 
 
@@ -579,9 +679,10 @@ def test_plain_render_applies_filters():
     assert "junk" not in out
 
 
-def test_no_classic_meta_when_layout_present_but_static_disabled():
-    """with a layout present but static strings disabled, neither the classic
-    meta table nor the layout tree is shown (spec 1.2/2.4)."""
+def test_classic_meta_fallback_when_layout_present_but_static_disabled():
+    """with a layout present but static strings disabled, the classic metadata
+    table renders as a fallback (file path, language, etc.) instead of dropping
+    all sample context."""
     doc = ResultDocument(
         metadata=Metadata(file_path="x", min_length=4),
         analysis=Analysis(
@@ -594,8 +695,24 @@ def test_no_classic_meta_when_layout_present_but_static_disabled():
         layout=ResultLayout(name="pe", offset=0, length=10),
     )
     out = render(doc, True, False, "auto")
-    assert "FLARE FLOSS RESULTS" not in out
+    assert "FLARE FLOSS RESULTS" in out
+    assert "file path" in out
+    # the layout tree itself is not shown when static strings are disabled
     assert "pe" not in out
+
+
+def test_layout_none_warns_filters_ignored(caplog):
+    """an active layout filter with no layout tree must warn, not silently no-op."""
+    doc = ResultDocument(
+        metadata=Metadata(file_path="x", min_length=4),
+        analysis=Analysis(enable_stack_strings=False, enable_tight_strings=False, enable_decoded_strings=False),
+        strings=Strings(),
+        layout=None,
+    )
+    with caplog.at_level("WARNING", logger="floss.render.default"):
+        render(doc, True, False, "auto", layout_filter=floss.render.filter.LayoutFilter(include_tags=["winapi"]))
+    assert "no layout tree" in caplog.text
+    assert "ignored" in caplog.text
 
 
 def test_summary_escapes_rich_markup():
@@ -613,7 +730,7 @@ def test_summary_escapes_rich_markup():
 
 def test_summary_ignores_plain(exefile, capsys):
     """--summary with --plain still renders the layout-backed summary."""
-    assert floss.main.main([exefile, "--summary", "--plain", "--no-string-type", "stack", "tight", "decoded"]) == 0
+    assert floss.main.main([exefile, "--summary", "--plain"]) == 0
     out = capsys.readouterr().out
     assert "FLOSS SUMMARY" in out
     assert "section counts" in out
@@ -621,7 +738,7 @@ def test_summary_ignores_plain(exefile, capsys):
 
 def test_main_summary_with_json(exefile, capsys):
     """--json takes precedence over --summary."""
-    assert floss.main.main([exefile, "-j", "--summary", "--no-string-type", "stack", "tight", "decoded"]) == 0
+    assert floss.main.main([exefile, "-j", "--summary"]) == 0
     out = capsys.readouterr().out
     assert "FLOSS SUMMARY" not in out
     json.loads(out)
@@ -662,13 +779,13 @@ def test_main_max_strings_larger_than_section(exefile, capsys):
 
 
 def _render_layout(layout):
-    from rich.console import Console
-
     import io
+
+    from rich.console import Console
 
     console = Console(file=io.StringIO(), width=80)
     render_strings(console, layout, {})
-    return console.file.getvalue()
+    return console.file.getvalue()  # type: ignore [attr-defined]
 
 
 def test_render_offset_not_truncated_by_depth():

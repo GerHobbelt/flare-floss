@@ -540,16 +540,16 @@ def is_string_type_enabled(type_, disabled_string_types, enabled_string_types):
 
 
 def expand_string_types(string_types):
-    """expand the `all` alias into the full set of concrete string types."""
+    """expand the `all` alias into the full set of concrete string types.
+
+    `all` may only be used on its own (validated at argument-parse time), so a
+    single value never needs deduplicating.
+    """
     from floss.cli import CONCRETE_STRING_TYPES, StringType
 
-    expanded: List[str] = []
-    for t in string_types:
-        if t == StringType.ALL.value:
-            expanded.extend(s.value for s in CONCRETE_STRING_TYPES)
-        else:
-            expanded.append(t)
-    return expanded
+    if string_types == [StringType.ALL.value]:
+        return [t.value for t in CONCRETE_STRING_TYPES]
+    return list(string_types)
 
 
 def get_max_size(size: int, max_: int, api: Optional[Tuple] = None, argv: Optional[Tuple] = None) -> int:

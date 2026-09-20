@@ -20,6 +20,7 @@ from pathlib import Path
 
 import rich.traceback
 
+import floss.cache
 import floss.results
 import floss.logging_
 import floss.render.json
@@ -36,6 +37,7 @@ from floss.utils import FileType, detect_file_type, expand_string_types, is_stri
 from floss.results import Analysis, load
 from floss.pipeline import Options, PipelineError, analyze
 from floss.render.filter import LayoutFilter
+from floss.language.identify import Language
 
 logger = floss.logging_.getLogger("floss")
 
@@ -68,13 +70,19 @@ def emit_json_error(message: str, code: int = 1) -> None:
     sys.stderr.write(json.dumps({"error": message, "code": code}) + "\n")
 
 
-JSON_SHORT_FLAG = re.compile(r"^-[a-z]*j")
+def report_error(parser, message: str) -> None:
+    """emit an error in the active output mode: JSON object on STDERR for
+    JSON modes, otherwise a plain message on STDERR."""
+    if parser.json_mode:
+        emit_json_error(message)
+    else:
+        print(message, file=sys.stderr)
 
 
 def json_requested(argv) -> bool:
     """best-effort detection of a JSON output mode before argument parsing completes."""
     argv = argv or []
-    return "--json" in argv or any(JSON_SHORT_FLAG.match(arg) for arg in argv)
+    return "--json" in argv or any(a == "-j" for a in argv)
 
 
 def build_layout_filter(args) -> LayoutFilter:
@@ -126,14 +134,31 @@ def main(argv=None) -> int:
             parser.print_help()
             return 1
         args = parser.parse_args(args=argv)
-        if args.enabled_string_types and args.disabled_string_types:
-            parser.error("--string-type and --no-string-type arguments are not allowed together")
-        if args.include_sections and args.exclude_sections:
-            parser.error("--section and --no-section arguments are not allowed together")
-        if args.include_structures and args.exclude_structures:
-            parser.error("--structure and --no-structure arguments are not allowed together")
-        if args.include_tags and args.exclude_tags:
-            parser.error("--tag and --no-tag arguments are not allowed together")
+        for flag, include, exclude in (
+            ("--string-type", args.enabled_string_types, args.disabled_string_types),
+            ("--section", args.include_sections, args.exclude_sections),
+            ("--structure", args.include_structures, args.exclude_structures),
+            ("--tag", args.include_tags, args.exclude_tags),
+        ):
+            if include and exclude:
+                parser.error("%s and --no-%s arguments are not allowed together" % (flag, flag[2:]))
+        for flag, values in (
+            ("--string-type", args.enabled_string_types),
+            ("--no-string-type", args.disabled_string_types),
+        ):
+            if len(values) > 1 and StringType.ALL.value in values:
+                parser.error("%s: 'all' cannot be combined with other string types" % flag)
+        if args.summary:
+            # the summary's layout-derived sections cover static strings only, so
+            # a non-static string-type selection is a shadow arg that does nothing.
+            # reject it instead of silently ignoring it.
+            for flag, values in (
+                ("--string-type", args.enabled_string_types),
+                ("--no-string-type", args.disabled_string_types),
+            ):
+                for value in values:
+                    if value != StringType.STATIC.value:
+                        parser.error("%s: '--summary' only covers static strings and does not take %s" % (flag, value))
         if args.max_strings is not None and args.max_strings <= 0:
             parser.error("--max-strings must be a positive integer")
         for pattern in args.queries:
@@ -142,13 +167,22 @@ def main(argv=None) -> int:
             except re.error as e:
                 parser.error("invalid --query regular expression %r: %s" % (pattern, e))
     except ArgumentValueError as e:
-        if json_requested(argv):
-            emit_json_error(str(e))
-        else:
-            print(e)
+        report_error(parser, str(e))
         return -1
 
     set_log_config(args.debug, args.quiet)
+
+    # caching applies to the default analysis variant only: an explicit format,
+    # language, or custom signatures change the analysis, so the content-
+    # addressed cache could return a mismatched document. disable it for those.
+    cache_dir = None
+    if (
+        not args.functions
+        and args.format == "auto"
+        and args.language == Language.AUTO.value
+        and args.signatures == SIGNATURES_PATH_DEFAULT_STRING
+    ):
+        cache_dir = floss.cache.get_cache_dir()
 
     if hasattr(args, "signatures"):
         if args.signatures == SIGNATURES_PATH_DEFAULT_STRING:
@@ -172,6 +206,12 @@ def main(argv=None) -> int:
     disabled_string_types = expand_string_types(list(args.disabled_string_types or []))
     enabled_string_types = expand_string_types(list(args.enabled_string_types or []))
 
+    if args.summary and not disabled_string_types and not enabled_string_types:
+        # the summary's layout-derived sections cover static strings only, so
+        # don't spin up the slow deobfuscation for stack/tight/decoded
+        logger.info("--summary is static-only; skipping stack/tight/decoded extraction")
+        disabled_string_types.extend([StringType.STACK.value, StringType.TIGHT.value, StringType.DECODED.value])
+
     if args.functions:
         static_was_enabled = is_string_type_enabled(StringType.STATIC, disabled_string_types, enabled_string_types)
         try:
@@ -187,10 +227,7 @@ def main(argv=None) -> int:
             elif not enabled_string_types and StringType.STATIC.value not in disabled_string_types:
                 disabled_string_types.append(StringType.STATIC.value)
         except ArgumentValueError as e:
-            if json_requested(argv):
-                emit_json_error(str(e))
-            else:
-                print(e)
+            report_error(parser, str(e))
             return -1
         if static_was_enabled:
             logger.warning("analyzing specified functions, not showing static strings")
@@ -243,7 +280,8 @@ def main(argv=None) -> int:
         large_file=args.large_file,
         quiet=args.quiet,
         verbose=args.verbose,
-        prompt_deobfuscation=True,
+        prompt_deobfuscation=args.prompt_deobfuscation,
+        cache_dir=cache_dir,
     )
 
     try:

@@ -32,8 +32,16 @@ from floss.tags.filter import TagRules
 # noisy tags that the --interesting shortcut excludes
 NOISY_TAGS: Set[str] = {"#common", "#duplicate", "#code", "#reloc", "#code-junk"}
 
-# tag names produced by the OSS string database, e.g. #openssl, #zlib
-OSS_TAG_NAMES_NORMALIZED: Set[str] = {name.partition(".")[0] for name in DEFAULT_FILENAMES}
+# tag families, one per tag-source directory under floss/tags/data. a meta tag
+# matches any tag in its family, so --tag winapi / --tag oss / --tag gp etc.
+# work as selectors.
+TAG_FAMILIES: dict = {
+    "winapi": {"#winapi"},
+    "crt": {"#msvc"},
+    "expert": {"#capa"},
+    "gp": {"#common", "#code-junk"},
+    "oss": {f"#{name.partition('.')[0]}" for name in DEFAULT_FILENAMES},
+}
 
 
 def normalize_tag(tag: str) -> str:
@@ -45,6 +53,10 @@ def normalize_tag(tag: str) -> str:
     return tag.lstrip("#").lower()
 
 
+# normalized (no leading #, lowercase) family names for lookup
+TAG_FAMILIES_NORMALIZED: dict = {name: {normalize_tag(t) for t in tags} for name, tags in TAG_FAMILIES.items()}
+
+
 def normalize_structure(name: str) -> str:
     """normalize a structure name so slugs match the stored names.
 
@@ -53,18 +65,59 @@ def normalize_structure(name: str) -> str:
     return name.strip().lower().replace("_", "-").replace(" ", "-")
 
 
+# known structure slugs, produced by the layout parsers (floss/layout/*.py)
+KNOWN_STRUCTURE_SLUGS = (
+    "import-table",
+    "export-table",
+    "rich-header",
+    "section-header",
+    "elf-header",
+    "program-header",
+    "string-table",
+    "symbol-table",
+    "macho-header",
+    "load-command",
+    "segment-header",
+)
+
+
 def tag_matches(user_tag: str, string_tags: Sequence[str]) -> bool:
     """true if ``user_tag`` (already normalized) matches any of ``string_tags``.
 
-    ``oss`` is a meta tag that matches any OSS library tag.
+    a tag family (e.g. ``oss``, ``winapi``, ``gp``) matches any tag in that
+    family; otherwise the tag is compared directly.
     """
     normalized = user_tag
-    if normalized == "oss":
-        return any(normalize_tag(tag) in OSS_TAG_NAMES_NORMALIZED for tag in string_tags)
+    family = TAG_FAMILIES_NORMALIZED.get(normalized)
+    if family is not None:
+        return any(normalize_tag(tag) in family for tag in string_tags)
     return any(normalize_tag(tag) == normalized for tag in string_tags)
 
 
-def is_arch_wrapper(layout: ResultLayout) -> bool:
+def relevance_key(s: ResultString, tag_rules: TagRules) -> Tuple[int, int]:
+    """sort key for --max-strings and high-value string ordering.
+
+    relevance order within a section:
+      1. strings with a highlighted tag first
+      2. then untagged strings
+      3. then strings with any non-noisy tag
+      4. then the rest (only noisy tags)
+    within each group, ascending by offset.
+    """
+    has_highlight = any(tag_rules.get(tag) == "highlight" for tag in s.tags)
+    has_non_noisy = any(tag not in NOISY_TAGS for tag in s.tags)
+    if has_highlight:
+        group = 0
+    elif not s.tags:
+        group = 1
+    elif has_non_noisy:
+        group = 2
+    else:
+        group = 3
+    return (group, s.offset)
+
+
+def is_macho_arch_wrapper(layout: ResultLayout) -> bool:
     """true when a node is a Mach-O fat-arch wrapper rather than a section.
 
     On a fat Mach-O the root's children are arch wrappers (``macho: x86_64``);
@@ -73,6 +126,16 @@ def is_arch_wrapper(layout: ResultLayout) -> bool:
     universal binary.
     """
     return layout.name.startswith("macho:")
+
+
+def is_section_child(parent: ResultLayout, child: ResultLayout, depth: int) -> bool:
+    """true when ``child`` is a binary section of ``parent``.
+
+    a child becomes a section when it is not a format wrapper (e.g. a Mach-O
+    fat-arch layer) and its parent is the root or an arch wrapper; otherwise it
+    inherits its containing section.
+    """
+    return not is_macho_arch_wrapper(child) and (depth == 0 or is_macho_arch_wrapper(parent))
 
 
 class LayoutFilter:
@@ -87,8 +150,8 @@ class LayoutFilter:
         exclude_structures: drop strings whose structure field is in this list.
         include_tags: keep strings with any matching tag.
         exclude_tags: drop strings with any matching tag.
-        interesting: drop strings that carry only noisy tags; strings with at
-            least one non-noisy tag are kept.
+        interesting: drop any string carrying a noisy tag, even when it also has
+            a non-noisy tag (e.g. #winapi #common is dropped).
         queries: regex patterns ORed against string content.
         max_strings: cap emitted strings per top-level section to the top N by
             relevance.
@@ -109,8 +172,8 @@ class LayoutFilter:
         max_strings: Optional[int] = None,
         tag_rules: Optional[TagRules] = None,
     ):
-        self.include_sections = list(include_sections or [])
-        self.exclude_sections = list(exclude_sections or [])
+        self.include_sections = set(include_sections or [])
+        self.exclude_sections = set(exclude_sections or [])
         self.include_structures = {normalize_structure(name) for name in (include_structures or [])}
         self.exclude_structures = {normalize_structure(name) for name in (exclude_structures or [])}
         self.include_tags = [normalize_tag(tag) for tag in (include_tags or [])]
@@ -150,9 +213,9 @@ class LayoutFilter:
             return False
         if self.exclude_tags and any(tag_matches(t, s.tags) for t in self.exclude_tags):
             return False
-        if self.interesting and s.tags and not any(tag not in NOISY_TAGS for tag in s.tags):
-            # drop strings that carry only noisy tags; keep strings that have
-            # at least one non-noisy tag (e.g. #winapi #common)
+        if self.interesting and any(tag in NOISY_TAGS for tag in s.tags):
+            # --interesting excludes any string carrying a noisy tag, even when
+            # it also has a non-noisy tag (e.g. #winapi #common is dropped)
             return False
 
         if self.queries and not any(pattern.search(s.string) for pattern in self.queries):
@@ -162,26 +225,8 @@ class LayoutFilter:
 
     @staticmethod
     def relevance_key(s: ResultString, tag_rules: TagRules) -> Tuple[int, int]:
-        """sort key for --max-strings.
-
-        relevance order within a section:
-          1. strings with a highlighted tag first
-          2. then untagged strings
-          3. then strings with any non-noisy tag
-          4. then the rest (only noisy tags)
-        within each group, ascending by offset.
-        """
-        has_highlight = any(tag_rules.get(tag) == "highlight" for tag in s.tags)
-        has_non_noisy = any(tag not in NOISY_TAGS for tag in s.tags)
-        if has_highlight:
-            group = 0
-        elif not s.tags:
-            group = 1
-        elif has_non_noisy:
-            group = 2
-        else:
-            group = 3
-        return (group, s.offset)
+        """sort key for --max-strings, see the module-level relevance_key."""
+        return relevance_key(s, tag_rules)
 
     def apply_node(self, layout: ResultLayout, section: str, depth: int) -> Optional[ResultLayout]:
         """filter one layout node, recursing into children.
@@ -203,10 +248,7 @@ class LayoutFilter:
 
         children: List[ResultLayout] = []
         for child in layout.children:
-            # a child becomes a section when it's not a format wrapper (e.g. a
-            # Mach-O fat-arch layer) and its parent is the root or an arch
-            # wrapper; otherwise it inherits its containing section
-            if not is_arch_wrapper(child) and (depth == 0 or is_arch_wrapper(layout)):
+            if is_section_child(layout, child, depth):
                 child_section = child.name
             else:
                 child_section = section
@@ -278,18 +320,19 @@ class LayoutFilter:
         # independently rather than the whole architecture.
         children: List[ResultLayout] = []
         for child in filtered.children:
-            if is_arch_wrapper(child):
+            if is_macho_arch_wrapper(child):
                 arch_children = []
                 for section in child.children:
                     capped = self.cap_node(section)
                     if capped is not None:
                         arch_children.append(capped)
+                ranked_wrapper = sorted(child.strings, key=lambda s: self.relevance_key(s, self.tag_rules))
                 children.append(
                     ResultLayout(
                         name=child.name,
                         offset=child.offset,
                         length=child.length,
-                        strings=child.strings[: self.max_strings],
+                        strings=ranked_wrapper[: self.max_strings],
                         children=arch_children,
                     )
                 )

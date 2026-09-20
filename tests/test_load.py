@@ -3,7 +3,6 @@ import textwrap
 from pathlib import Path
 
 import pytest
-
 from fixtures import exefile
 
 import floss.main
@@ -133,14 +132,14 @@ def test_detect_file_type_not_results_for_non_floss_json(tmp_path):
 def test_filter_string_len_filters_language_and_layout():
     """-n on a loaded document must prune language and layout strings too."""
     from floss.results import (
-        StringEncoding,
-        StaticString,
+        Strings,
+        Analysis,
+        Metadata,
         ResultLayout,
         ResultString,
+        StaticString,
         ResultDocument,
-        Metadata,
-        Analysis,
-        Strings,
+        StringEncoding,
         filter_string_len,
     )
 
@@ -165,17 +164,68 @@ def test_filter_string_len_filters_language_and_layout():
     assert doc.strings.language_strings == []
 
 
+def test_filter_string_len_aborts_when_requested_below_stored():
+    """-n below the stored extraction min_length must abort: those strings are gone."""
+    import pytest
+
+    from floss.results import (
+        Strings,
+        Analysis,
+        Metadata,
+        ResultDocument,
+        InvalidLoadConfig,
+        filter_string_len,
+    )
+
+    doc = ResultDocument(
+        metadata=Metadata(file_path="x", min_length=6),
+        analysis=Analysis(
+            enable_static_strings=False,
+            enable_stack_strings=False,
+            enable_tight_strings=False,
+            enable_decoded_strings=False,
+        ),
+        strings=Strings(),
+    )
+    with pytest.raises(InvalidLoadConfig, match="minimum-length 4"):
+        filter_string_len(doc, 4)
+
+
+def test_filter_string_len_ok_when_at_or_above_stored():
+    """-n equal to or above the stored min_length is fine, no abort."""
+    from floss.results import (
+        Strings,
+        Analysis,
+        Metadata,
+        ResultDocument,
+        filter_string_len,
+    )
+
+    doc = ResultDocument(
+        metadata=Metadata(file_path="x", min_length=4),
+        analysis=Analysis(
+            enable_static_strings=False,
+            enable_stack_strings=False,
+            enable_tight_strings=False,
+            enable_decoded_strings=False,
+        ),
+        strings=Strings(),
+    )
+    filter_string_len(doc, 4)
+    filter_string_len(doc, 6)
+
+
 def test_filter_functions_accepts_stack_only_function():
     """a function with only stack strings (no decoding score) is valid."""
     from floss.results import (
-        StringEncoding,
+        Strings,
+        Analysis,
+        Metadata,
         StackString,
         ResultDocument,
-        Metadata,
-        Analysis,
-        Strings,
-        filter_functions,
+        StringEncoding,
         InvalidLoadConfig,
+        filter_functions,
     )
 
     ss = StackString(

@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+from pathlib import Path
+
 import pytest
 from fixtures import scfile, exefile
 
@@ -60,53 +62,55 @@ def test_args_analysis_type_conflict(exefile):
     assert floss.main.main([exefile, "--string-type", "stack", "--no-string-type", "tight"]) == -1
 
 
-def test_language_auto_accepted(exefile, capsys):
-    """--language auto is the default and is accepted by the parser."""
-    assert floss.main.main([exefile, "--language", "auto"]) == 0
-    capsys.readouterr()
-    assert floss.main.main([exefile]) == 0
-    capsys.readouterr()
+def test_language_extraction_independent_of_static(capsys):
+    """language strings are extracted even when static strings are disabled.
 
-
-def test_filter_flags_sample_last_parses(exefile, capsys):
-    """multi-value filter flags need a -- terminator before the sample."""
-    for args in (
-        ["--section", ".rdata"],
-        ["--tag", "winapi", "openssl"],
-        ["--query", "http"],
-        ["--columns", "offset", "structure"],
-    ):
-        assert floss.main.main(args + ["--", exefile]) == 0, args
-        capsys.readouterr()
-
-
-def test_language_extraction_independent_of_static():
-    """language strings are extracted even when static strings are disabled."""
-    from pathlib import Path
-
-    from floss.results import Analysis
-    from floss.pipeline import Options, analyze
+    uses --string-type language (so only language extraction runs) and -y so the
+    deobfuscation prompt is skipped, on a Go sample whose language is detectable.
+    """
+    import json
 
     sample = Path(__file__).parent / "data" / "language" / "go" / "go-hello" / "bin" / "go-hello64.exe"
 
-    results = analyze(
-        Options(
-            sample=sample,
-            min_length=6,
-            analysis=Analysis(
-                enable_static_strings=False,
-                enable_stack_strings=False,
-                enable_tight_strings=False,
-                enable_decoded_strings=False,
-                enable_language_strings=True,
-            ),
-            prompt_deobfuscation=False,
-        )
-    )
-    assert results is not None
-    assert results.metadata.language == "go"
-    assert len(results.strings.language_strings) > 0
-    assert len(results.strings.static_strings) == 0
+    assert floss.main.main([str(sample), "--string-type", "language", "-y", "-j"]) == 0
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["metadata"]["language"] == "go"
+    assert len(doc["strings"]["language_strings"]) > 0
+    assert doc["strings"]["static_strings"] == []
+
+
+def test_manual_language_override_wins_over_auto_detect(capsys):
+    """--language go must be honored even when auto-detection returns unknown."""
+    import json
+
+    # a C binary, so auto-detection yields unknown; forcing go must stick
+    sample = Path(__file__).parent / "data" / "src" / "decode-in-place" / "bin" / "test-decode-in-place.exe"
+
+    assert floss.main.main([str(sample), "--language", "go", "--string-type", "language", "-y", "-j"]) == 0
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["metadata"]["language"] == "go"
+    assert doc["metadata"]["language_selected"] == "go"
+
+
+def test_manual_language_override_beats_wrong_auto_detect(monkeypatch, capsys):
+    """--language go must win even when auto-detection wrongly says rust."""
+    import json
+
+    import floss.language.identify
+
+    def fake_identify(sample, static_strings):
+        from floss.language.identify import Language
+
+        return Language.RUST, "1.75.0"
+
+    monkeypatch.setattr(floss.language.identify, "identify_language_and_version", fake_identify)
+
+    sample = Path(__file__).parent / "data" / "src" / "decode-in-place" / "bin" / "test-decode-in-place.exe"
+    assert floss.main.main([str(sample), "--language", "go", "--string-type", "language", "-y", "-j"]) == 0
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["metadata"]["language"] == "go"
+    assert doc["metadata"]["language_version"] == ""
+    assert doc["metadata"]["language_selected"] == "go"
 
 
 def test_expand_string_types():

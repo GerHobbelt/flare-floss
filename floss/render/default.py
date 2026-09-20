@@ -328,11 +328,8 @@ def render_heading(heading, console, verbose, disable_headers):
     """
     if disable_headers:
         return
-    style = ""
-    if verbose != Verbosity.DEFAULT:
-        style = "cyan"
-    table = Table(box=box.HORIZONTALS, style=style, show_header=False)
-    table.add_row(heading, style=style)
+    table = Table(box=box.HORIZONTALS, show_header=False)
+    table.add_row(heading)
     console.print(table)
     console.print()
 
@@ -349,12 +346,9 @@ def render_section_heading(name, console, verbose, disable_headers):
     """
     if disable_headers:
         return
-    style = ""
-    if verbose != Verbosity.DEFAULT:
-        style = "cyan"
 
-    line = Text("─" * console.width, style=style)
-    heading = Text(name.center(console.width), style=style)
+    line = Text("─" * console.width)
+    heading = Text(name.center(console.width))
     console.print(line)
     console.print(heading)
     console.print(line)
@@ -390,6 +384,19 @@ def get_color(color):
     return color_system
 
 
+def effective_tag_rules(layout_filter: Optional[LayoutFilter]) -> TagRules:
+    """tag rules for the layout view.
+
+    When the user expressed tag intent (--tag or --interesting), the default
+    hide rules (e.g. #code, #reloc) must not drop strings the filter
+    deliberately kept — the filter already narrowed the set, so re-hiding would
+    undo it. Without a tag filter the default hide behavior is unchanged.
+    """
+    if layout_filter is not None and (layout_filter.include_tags or layout_filter.interesting):
+        return {tag: "default" if rule == "hide" else rule for tag, rule in DEFAULT_TAG_RULES.items()}
+    return DEFAULT_TAG_RULES
+
+
 def render(
     results: floss.results.ResultDocument,
     verbose,
@@ -402,29 +409,35 @@ def render(
     sys.__stdout__.reconfigure(encoding="utf-8")  # type: ignore [union-attr]
     console = Console(file=io.StringIO(), color_system=get_color(color), highlight=False, soft_wrap=True)
 
+    if not columns:
+        columns = DEFAULT_COLUMNS
+
+    if layout_filter is not None and layout_filter.active and results.layout is None:
+        logger.warning(
+            "layout-aware filters (--section, --structure, --tag, --query, --max-strings, --interesting) "
+            "have no layout tree to apply to and are ignored"
+        )
+
     # layout-aware path: no classic meta table (spec 1.2/2.4). the layout tree
     # is the static string view, so it is only rendered when static strings are
-    # enabled; when they are disabled, nothing is shown for statics.
-    if not plain and results.layout is not None:
-        if results.analysis.enable_static_strings:
-            layout = results.layout
-            if layout_filter is not None and layout_filter.active:
-                filtered = layout_filter.apply(layout)
-                if filtered is None:
-                    layout = ResultLayout(name=layout.name, offset=layout.offset, length=layout.length)
-                else:
-                    layout = filtered
+    # enabled; otherwise fall back to the classic metadata view.
+    if not plain and results.layout is not None and results.analysis.enable_static_strings:
+        layout = results.layout
+        if layout_filter is not None and layout_filter.active:
+            filtered = layout_filter.apply(layout)
+            if filtered is None:
+                layout = ResultLayout(name=layout.name, offset=layout.offset, length=layout.length)
+            else:
+                layout = filtered
 
-            # when the user expressed tag intent (--tag or --interesting), don't let
-            # the default hide rules (e.g. #code, #reloc) drop strings the filter
-            # deliberately kept. tag-aware filtering already narrowed the set.
-            tag_rules = DEFAULT_TAG_RULES
-            if layout_filter is not None and (layout_filter.include_tags or layout_filter.interesting):
-                tag_rules = {tag: "default" if rule == "hide" else rule for tag, rule in DEFAULT_TAG_RULES.items()}
+        # when the user expressed tag intent (--tag or --interesting), don't let
+        # the default hide rules (e.g. #code, #reloc) drop strings the filter
+        # deliberately kept. tag-aware filtering already narrowed the set.
+        tag_rules = effective_tag_rules(layout_filter)
 
-            layout_view = hide_strings_by_rules(layout, tag_rules)
-            render_strings(console, layout_view, tag_rules, columns=columns)
-            console.print()
+        layout_view = hide_strings_by_rules(layout, tag_rules)
+        render_strings(console, layout_view, tag_rules, columns=columns)
+        console.print()
     else:
         if not disable_headers:
             console.print("\n")

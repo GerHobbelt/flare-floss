@@ -15,7 +15,6 @@
 import os
 import re
 import sys
-import json
 import mmap
 import time
 import inspect
@@ -24,7 +23,7 @@ import argparse
 import builtins
 import contextlib
 from enum import Enum
-from typing import Set, Tuple, Iterable, Optional
+from typing import Set, List, Tuple, Iterable, Optional
 from pathlib import Path
 from collections import OrderedDict
 
@@ -67,6 +66,10 @@ class FileType(str, Enum):
     RESULTS = "results"  # a saved FLOSS results document
 
 
+# how many leading bytes to sniff when detecting a results document
+_RESULTS_SNIFF_SIZE = 8192
+
+
 def detect_file_type(sample: Path) -> FileType:
     """
     Detect the kind of a file from its content.
@@ -77,34 +80,27 @@ def detect_file_type(sample: Path) -> FileType:
     need a version.
 
     Binary samples are rejected cheaply by peeking the first non-whitespace
-    byte. The full file is loaded and parsed only when the content looks
-    like JSON, so large binaries are not read for the check.
+    byte. Results documents are recognized by a fast byte-sequence check over
+    the leading chunk for the top-level keys, so large binaries that happen to
+    start with '{' are not read or parsed in full. Strict validation of the
+    document structure happens when the file is loaded.
     """
-    with sample.open("rb") as f:
-        magic = f.read(4)
-
-    if magic == SUPPORTED_FILE_MAGIC_ELF:
-        return FileType.ELF
-    elif magic[:2] == SUPPORTED_FILE_MAGIC_PE:
-        return FileType.PE
-
     try:
         with sample.open("rb") as f:
-            for byte in iter(lambda: f.read(1), b""):
-                if not byte.strip():
-                    continue
-                if byte != b"{":
-                    return FileType.UNSUPPORTED
-                break
+            chunk = f.read(_RESULTS_SNIFF_SIZE)
     except OSError:
         return FileType.UNSUPPORTED
 
-    try:
-        data = json.loads(sample.read_bytes())
-    except (OSError, ValueError):
+    if chunk[:4] == SUPPORTED_FILE_MAGIC_ELF:
+        return FileType.ELF
+    elif chunk[:2] == SUPPORTED_FILE_MAGIC_PE:
+        return FileType.PE
+
+    stripped = chunk.lstrip()
+    if not stripped or stripped[:1] != b"{":
         return FileType.UNSUPPORTED
 
-    if isinstance(data, dict) and all(k in data for k in ("metadata", "analysis", "strings")):
+    if all(key in chunk for key in (b'"metadata"', b'"analysis"', b'"strings"')):
         return FileType.RESULTS
 
     return FileType.UNSUPPORTED
@@ -541,6 +537,19 @@ def is_string_type_enabled(type_, disabled_string_types, enabled_string_types):
         return type_ in enabled_string_types
     else:
         return True
+
+
+def expand_string_types(string_types):
+    """expand the `all` alias into the full set of concrete string types."""
+    from floss.cli import CONCRETE_STRING_TYPES, StringType
+
+    expanded: List[str] = []
+    for t in string_types:
+        if t == StringType.ALL.value:
+            expanded.extend(s.value for s in CONCRETE_STRING_TYPES)
+        else:
+            expanded.append(t)
+    return expanded
 
 
 def get_max_size(size: int, max_: int, api: Optional[Tuple] = None, argv: Optional[Tuple] = None) -> int:

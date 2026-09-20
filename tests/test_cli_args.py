@@ -26,8 +26,10 @@ def test_functions(exefile):
 
     # ok
     assert floss.main.main([exefile, "--analyze-functions", "0x401560"]) == 0
-    assert floss.main.main([exefile, "--analyze-functions", "0x401560"]) == 0
     assert floss.main.main([exefile, "--analyze-functions", "0x401560", "0x401000"]) == 0
+
+    # --string-type static only cannot be combined with --analyze-functions
+    assert floss.main.main([exefile, "--analyze-functions", "0x401560", "--string-type", "static"]) == -1
 
 
 def test_shellcode(scfile):
@@ -56,6 +58,62 @@ def test_args_analysis_type(exefile, analysis, type_):
 
 def test_args_analysis_type_conflict(exefile):
     assert floss.main.main([exefile, "--string-type", "stack", "--no-string-type", "tight"]) == -1
+
+
+def test_language_auto_accepted(exefile, capsys):
+    """--language auto is the default and is accepted by the parser."""
+    assert floss.main.main([exefile, "--language", "auto"]) == 0
+    capsys.readouterr()
+    assert floss.main.main([exefile]) == 0
+    capsys.readouterr()
+
+
+def test_filter_flags_sample_last_parses(exefile, capsys):
+    """multi-value filter flags need a -- terminator before the sample."""
+    for args in (
+        ["--section", ".rdata"],
+        ["--tag", "winapi", "openssl"],
+        ["--query", "http"],
+        ["--columns", "offset", "structure"],
+    ):
+        assert floss.main.main(args + ["--", exefile]) == 0, args
+        capsys.readouterr()
+
+
+def test_language_extraction_independent_of_static():
+    """language strings are extracted even when static strings are disabled."""
+    from pathlib import Path
+
+    from floss.results import Analysis
+    from floss.pipeline import Options, analyze
+
+    sample = Path(__file__).parent / "data" / "language" / "go" / "go-hello" / "bin" / "go-hello64.exe"
+
+    results = analyze(
+        Options(
+            sample=sample,
+            min_length=6,
+            analysis=Analysis(
+                enable_static_strings=False,
+                enable_stack_strings=False,
+                enable_tight_strings=False,
+                enable_decoded_strings=False,
+                enable_language_strings=True,
+            ),
+            prompt_deobfuscation=False,
+        )
+    )
+    assert results is not None
+    assert results.metadata.language == "go"
+    assert len(results.strings.language_strings) > 0
+    assert len(results.strings.static_strings) == 0
+
+
+def test_expand_string_types():
+    from floss.utils import expand_string_types
+
+    assert set(expand_string_types(["all"])) == {"static", "stack", "tight", "decoded", "language"}
+    assert expand_string_types(["static", "stack"]) == ["static", "stack"]
 
 
 def test_no_layout_yields_classic_static(exefile):

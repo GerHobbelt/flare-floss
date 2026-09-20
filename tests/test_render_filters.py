@@ -531,7 +531,7 @@ def test_summary_section_counts_thread_top_level():
 def test_summary_section_counts_thread_fat_macho():
     """on a fat Mach-O, strings under an arch wrapper's segments count under
     their segment (__TEXT), while the wrapper's own strings count under the
-    root."""
+    arch wrapper (macho: x86_64), and the root strings count under the root."""
     root_s = ResultString(string="root", offset=1, size=4, encoding="ascii")
     wrapper_s = ResultString(string="wrapper", offset=2, size=7, encoding="ascii")
     text_s = ResultString(string="text", offset=3, size=4, encoding="ascii")
@@ -553,7 +553,7 @@ def test_summary_section_counts_thread_fat_macho():
         ],
     )
     counts, _, _ = floss.render.summary.analyze_layout(layout)
-    assert counts == {"macho (fat)": 2, "__TEXT": 1}
+    assert counts == {"macho (fat)": 1, "__TEXT": 1, "macho: x86_64": 1}
     assert sum(counts.values()) == 3
 
 
@@ -561,7 +561,7 @@ def test_main_summary_flag(exefile, capsys):
     assert floss.main.main([exefile, "--summary"]) == 0
     out = capsys.readouterr().out
     assert "FLOSS SUMMARY" in out
-    assert "string counts" in out
+    assert "extracted strings" in out
 
 
 def test_main_summary_is_static_only_by_default(exefile, capsys):
@@ -570,21 +570,29 @@ def test_main_summary_is_static_only_by_default(exefile, capsys):
     out = capsys.readouterr().out
     assert "FLOSS SUMMARY" in out
     # counts show recovered strings as 0 because they were not extracted
-    assert "| stack strings | 0 |" in out
+    assert "stack           0" in out
+    assert "tight           0" in out
+    assert "decoded         0" in out
 
 
-def test_main_summary_rejects_non_static_string_type(exefile, capsys):
-    """--summary only covers static strings, so non-static types are rejected."""
-    assert floss.main.main([exefile, "--summary", "--string-type", "stack", "tight", "decoded"]) == -1
+def test_main_summary_rejects_string_type(exefile, capsys):
+    """--summary is its own static-only view, so any string-type selection is rejected."""
+    assert floss.main.main([exefile, "--summary", "--string-type", "static"]) == -1
+    err = capsys.readouterr().err
+    assert "--summary" in err
+
+    assert floss.main.main([exefile, "--summary", "--no-string-type", "static"]) == -1
     err = capsys.readouterr().err
     assert "--summary" in err
 
 
-def test_main_summary_accepts_explicit_static(exefile, capsys):
-    """--summary with an explicit static selection is fine."""
-    assert floss.main.main([exefile, "--summary", "--string-type", "static"]) == 0
-    out = capsys.readouterr().out
-    assert "FLOSS SUMMARY" in out
+def test_main_summary_rejects_analyze_functions(exefile, capsys):
+    """--summary is static-only and --analyze-functions cannot show static, so
+    combining them must error instead of silently disabling every type."""
+    assert floss.main.main([exefile, "--summary", "--analyze-functions", "0x401000"]) == -1
+    err = capsys.readouterr().err
+    assert "--summary" in err
+    assert "--analyze-functions" in err
 
 
 def test_summary_no_layout_ok():
@@ -593,7 +601,7 @@ def test_summary_no_layout_ok():
     results.layout = None
     out = floss.render.summary.render_summary(results, "auto")
     assert "FLOSS SUMMARY" in out
-    assert "string counts" in out
+    assert "extracted strings" in out
 
 
 def test_main_json_error(capsys, exefile):
@@ -733,7 +741,7 @@ def test_summary_ignores_plain(exefile, capsys):
     assert floss.main.main([exefile, "--summary", "--plain"]) == 0
     out = capsys.readouterr().out
     assert "FLOSS SUMMARY" in out
-    assert "section counts" in out
+    assert "preview" in out
 
 
 def test_main_summary_with_json(exefile, capsys):

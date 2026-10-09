@@ -373,7 +373,7 @@ def collect_pe_structures(slice_: Slice, pe: pefile.PE) -> Sequence[Structure]:
     return structures
 
 
-def compute_pe_layout(slice_: Slice, xor_key: int | None) -> Layout:
+def compute_pe_layout(slice_: Slice, xor_key: int | None, depth: int = 0) -> Layout:
     data = slice_.data
 
     try:
@@ -476,8 +476,14 @@ def compute_pe_layout(slice_: Slice, xor_key: int | None) -> Layout:
         )
 
     # the "overlay" may contain Authenticode digital signatures
-    security = pe.OPTIONAL_HEADER.DATA_DIRECTORY[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_SECURITY"]]
-    if security.VirtualAddress and security.Size - 1 > 0:
+    security = None
+    if pe.OPTIONAL_HEADER is not None and pe.OPTIONAL_HEADER.DATA_DIRECTORY is not None:
+        try:
+            security = pe.OPTIONAL_HEADER.DATA_DIRECTORY[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_SECURITY"]]
+        except IndexError:
+            pass
+
+    if security is not None and security.VirtualAddress and security.Size - 1 > 0:
         overlay: Layout = layout.children[-1]
         if overlay.name != "overlay":
             logger.debug("expected overlay to be present")
@@ -552,9 +558,12 @@ def compute_pe_layout(slice_: Slice, xor_key: int | None) -> Layout:
 
         for resource in resources:
             # parse content of resources, such as embedded PE files
-            from floss.layout import compute_layout
+            from floss.layout import LayoutNestingError, compute_layout
 
-            resource.add_child(compute_layout(resource.slice))
+            if resource.slice.range == slice_.range:
+                raise LayoutNestingError(f"resource '{resource.name}' covers the enclosing PE")
+
+            resource.add_child(compute_layout(resource.slice, depth + 1))
 
         for resource in resources:
             # place resources into their parent section, usually .rsrc

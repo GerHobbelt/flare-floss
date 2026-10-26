@@ -110,7 +110,7 @@ dependencies = [
     # layout / tagging
     "dnfile==0.18.0",
     "colorama==0.4.6",
-    "msgspec==0.21.1",
+    "msgspec==0.22.0",
     "python-lancelot==0.10.0",
     "pyelftools==0.33",
 ]
@@ -143,7 +143,7 @@ dev = [
     "pytest-instafail==0.5.0",
     "pytest-cov==7.1.0",
     "pycodestyle==2.15.0",
-    "black==26.5.1",
+    "black==26.10.1",
     "isort==9.0.1",
     "mypy==2.3.0",
     # type stubs for mypy
